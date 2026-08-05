@@ -6,10 +6,10 @@ from .any4d_adapter import (
     load_official_any4d_model,
 )
 from .geometry_adapter import GeometryAdapter, GeometryOutput, MockGeometryAdapter
-from .rgb_temporal_consistency import compute_rgb_temporal_error
 from .vggrpo_reward import (
     CameraMotionRewardConfig,
     CameraMotionRewardOutput,
+    CrossViewGeometryReward,
     GeometryRewardOutput,
     GeometryRewardConfig,
     GroupNormalizationConfig,
@@ -20,6 +20,7 @@ from .vggrpo_reward import (
     VGGRPORewardComponents,
     assemble_reward_output,
     compute_camera_motion_rewards,
+    compute_cross_view_geometry_reward,
     compute_geometry_rewards,
     compute_single_view_camera_motion_reward,
     compute_single_view_geometry_reward,
@@ -36,6 +37,7 @@ __all__ = [
     "GeometryOutput",
     "CameraMotionRewardConfig",
     "CameraMotionRewardOutput",
+    "CrossViewGeometryReward",
     "GeometryRewardConfig",
     "GeometryRewardOutput",
     "GroupNormalizationConfig",
@@ -47,8 +49,8 @@ __all__ = [
     "VGGRPORewardComponents",
     "assemble_reward_output",
     "compute_camera_motion_rewards",
+    "compute_cross_view_geometry_reward",
     "compute_geometry_rewards",
-    "compute_rgb_temporal_error",
     "compute_single_view_camera_motion_reward",
     "compute_single_view_geometry_reward",
     "compute_vggrpo_reward",

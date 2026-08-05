@@ -198,10 +198,8 @@ __pycache__/
 /data/ood/
 /outputs/
 
-# Geometry-v2 keeps only the frozen contract and final objective summaries in Git.
+# Geometry-v2 experiment outputs stay local; only the frozen contract is tracked.
 /validation/geometry_v2_v1/*
-!/validation/geometry_v2_v1/heldout_analysis.json
-!/validation/geometry_v2_v1/candidate_ranking_analysis.json
 
 # Local tooling used to produce the non-release Geometry-v2 audit.
 /data_tools/

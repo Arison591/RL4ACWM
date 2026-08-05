@@ -1,4 +1,4 @@
-"""VGGRPO-style camera-motion and geometry rewards for RGB model outputs."""
+"""VGGRPO-style motion plus temporal/cross-view geometry rewards."""
 
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional, Tuple
@@ -7,22 +7,24 @@ import torch
 from torch import Tensor
 
 from .geometry_adapter import GeometryAdapter, GeometryOutput
-from .rgb_temporal_consistency import compute_rgb_temporal_error
-
-
 @dataclass(frozen=True)
 class GeometryRewardConfig:
-    """Configuration for geometry reprojection consistency."""
+    """Configuration for temporal and calibrated cross-view geometry."""
 
     num_views: int = 3
     topk_worst_frames: int = 3
     eps: float = 1.0e-8
     min_valid_projected_pixels: int = 128
     static_flow_threshold: float = 3.0e-2
-    rgb_temporal_weight: float = 0.75
+    temporal_weight: float = 0.25
+    cross_view_weight: float = 0.75
+    cross_view_mean_weight: float = 0.5
+    cross_view_worst_weight: float = 0.5
     static_error_scale: float = 2.0e-1
-    rgb_resize_long_side: int = 160
-    min_rgb_temporal_frames: int = 7
+    confidence_drop_quantile: float = 0.2
+    occlusion_relative_tolerance: float = 0.05
+    relative_error_cap: float = 1.0
+    min_valid_cross_view_frames: int = 3
 
     def __post_init__(self) -> None:
         if self.num_views <= 0:
@@ -35,14 +37,31 @@ class GeometryRewardConfig:
             raise ValueError("min_valid_projected_pixels must be positive")
         if self.static_flow_threshold < 0:
             raise ValueError("static_flow_threshold must be non-negative")
-        if not 0.0 <= self.rgb_temporal_weight <= 1.0:
-            raise ValueError("rgb_temporal_weight must be in [0, 1]")
+        if self.temporal_weight < 0 or self.cross_view_weight < 0:
+            raise ValueError("geometry component weights must be non-negative")
+        if abs(self.temporal_weight + self.cross_view_weight - 1.0) > self.eps:
+            raise ValueError("temporal_weight and cross_view_weight must sum to 1")
+        if self.cross_view_mean_weight < 0 or self.cross_view_worst_weight < 0:
+            raise ValueError("cross-view aggregation weights must be non-negative")
+        if (
+            abs(
+                self.cross_view_mean_weight
+                + self.cross_view_worst_weight
+                - 1.0
+            )
+            > self.eps
+        ):
+            raise ValueError("cross-view mean and worst weights must sum to 1")
         if self.static_error_scale <= 0:
             raise ValueError("static_error_scale must be positive")
-        if self.rgb_resize_long_side <= 0:
-            raise ValueError("rgb_resize_long_side must be positive")
-        if self.min_rgb_temporal_frames < 2:
-            raise ValueError("min_rgb_temporal_frames must be at least 2")
+        if not 0.0 <= self.confidence_drop_quantile < 1.0:
+            raise ValueError("confidence_drop_quantile must be in [0, 1)")
+        if self.occlusion_relative_tolerance < 0:
+            raise ValueError("occlusion_relative_tolerance must be non-negative")
+        if self.relative_error_cap <= 0:
+            raise ValueError("relative_error_cap must be positive")
+        if self.min_valid_cross_view_frames <= 0:
+            raise ValueError("min_valid_cross_view_frames must be positive")
 
 
 @dataclass(frozen=True)
@@ -100,19 +119,32 @@ class SingleViewGeometryReward:
 
 
 @dataclass
+class CrossViewGeometryReward:
+    """Calibrated, synchronous geometry consistency across camera pairs."""
+
+    reward: Tensor
+    valid: bool
+    pair_errors: Tensor
+    pair_valid_mask: Tensor
+    diagnostics: Dict[str, Any] = field(default_factory=dict)
+
+
+@dataclass
 class GeometryRewardOutput:
-    """Geometry rewards for a GRPO candidate group.
+    """Joint cross-view geometry rewards for a GRPO candidate group.
 
     For input ``[K, V, T, C, H, W]``, ``geometry_reward`` and
-    ``valid_mask`` have shape ``[K]``, while per-view tensors have shape
-    ``[K, V]``.  For input ``[B, K, V, T, C, H, W]``, the corresponding
-    shapes are ``[B, K]`` and ``[B, K, V]``.
+    ``valid_mask`` have shape ``[K]``.  Per-view tensors contain the retained
+    temporal component and per-pair tensors contain the new cross-view
+    component.  Pair order is recorded in diagnostics.
     """
 
     geometry_reward: Tensor
     per_view_reward: Tensor
     valid_mask: Tensor
     per_view_valid_mask: Tensor
+    per_pair_reward: Tensor
+    per_pair_valid_mask: Tensor
     diagnostics: Dict[str, Any] = field(default_factory=dict)
 
 
@@ -169,6 +201,8 @@ class RewardOutput:
     per_view_motion_valid_mask: Optional[Tensor]
     per_view_geometry_reward: Tensor
     per_view_valid_mask: Tensor
+    per_pair_geometry_reward: Tensor
+    per_pair_geometry_valid_mask: Tensor
     diagnostics: Dict[str, Any] = field(default_factory=dict)
 
 
@@ -516,6 +550,14 @@ def _validate_geometry_shapes(output: GeometryOutput) -> Optional[str]:
                 f"{output.point_valid_mask.dtype}"
             )
 
+    if output.confidence is not None:
+        expected_confidence_shape = (num_frames, height, width)
+        if tuple(output.confidence.shape) != expected_confidence_shape:
+            return (
+                f"confidence must have shape {expected_confidence_shape}, "
+                f"got {tuple(output.confidence.shape)}"
+            )
+
     if output.intrinsics is None:
         return "intrinsics are required for geometry reprojection"
     expected_intrinsics_shape = (num_frames, 3, 3)
@@ -538,6 +580,8 @@ def _validate_geometry_shapes(output: GeometryOutput) -> Optional[str]:
         named_tensors["scene_flows"] = output.scene_flows
     if output.point_valid_mask is not None:
         named_tensors["point_valid_mask"] = output.point_valid_mask
+    if output.confidence is not None:
+        named_tensors["confidence"] = output.confidence
     for name, tensor in named_tensors.items():
         if tensor.device != reference_device:
             return f"{name} must be on device {reference_device}, got {tensor.device}"
@@ -643,9 +687,8 @@ def _reproject_depth(
 def compute_single_view_geometry_reward(
     output: GeometryOutput,
     config: GeometryRewardConfig,
-    video: Optional[Tensor] = None,
 ) -> SingleViewGeometryReward:
-    """Compute worst-frame reprojection consistency for one video view.
+    """Compute retained Any4D temporal reprojection for one video view.
 
     For every frame, all valid static world points are projected into that
     frame.  The per-frame error is the mean absolute depth difference on pixels
@@ -739,49 +782,8 @@ def compute_single_view_geometry_reward(
     static_error = worst_errors.mean()
     diagnostics["static_reprojection_error"] = static_error
 
-    # Direct formula audits may omit RGB and intentionally exercise only the
-    # Any4D reprojection component.  The training path always supplies video.
-    if video is None or config.rgb_temporal_weight == 0.0:
-        reward = -static_error
-        diagnostics["reward_version"] = "static_reprojection_only"
-    else:
-        if video.shape[0] < config.min_rgb_temporal_frames:
-            return _invalid_geometry_reward(
-                output,
-                "insufficient_rgb_temporal_frames",
-                (
-                    f"only {video.shape[0]} RGB frames; need at least "
-                    f"{config.min_rgb_temporal_frames}"
-                ),
-                diagnostics,
-            )
-        try:
-            rgb_error, rgb_diagnostics = compute_rgb_temporal_error(
-                video,
-                resize_long_side=config.rgb_resize_long_side,
-                topk_worst_pairs=config.topk_worst_frames,
-            )
-        except (RuntimeError, ValueError) as error:
-            return _invalid_geometry_reward(
-                output,
-                "rgb_temporal_failure",
-                f"RGB temporal consistency failed: {error}",
-                diagnostics,
-            )
-        rgb_error = rgb_error.to(static_error.device)
-        static_normalized = static_error / config.static_error_scale
-        reward = -(
-            (1.0 - config.rgb_temporal_weight) * static_normalized
-            + config.rgb_temporal_weight * rgb_error
-        )
-        diagnostics.update(
-            {
-                "reward_version": "any4d_rgb_temporal_v2",
-                "static_normalized_error": static_normalized,
-                "rgb_temporal_error": rgb_error,
-                "rgb_temporal": rgb_diagnostics,
-            }
-        )
+    reward = -static_error
+    diagnostics["reward_version"] = "geometry_v2_temporal_component"
 
     return SingleViewGeometryReward(
         reward=reward,
@@ -791,26 +793,326 @@ def compute_single_view_geometry_reward(
     )
 
 
+def _scaled_intrinsics(
+    intrinsics: Tensor,
+    source_size: Tuple[int, int],
+    target_size: Tuple[int, int],
+) -> Tensor:
+    source_height, source_width = source_size
+    target_height, target_width = target_size
+    scaled = intrinsics.clone()
+    scaled[0] *= target_width / source_width
+    scaled[1] *= target_height / source_height
+    return scaled
+
+
+def _depth_confidence_mask(
+    output: GeometryOutput,
+    frame_index: int,
+    drop_quantile: float,
+) -> Tensor:
+    mask = output.valid_mask[frame_index].clone()
+    if output.confidence is None:
+        return mask
+    confidence = output.confidence[frame_index]
+    mask &= torch.isfinite(confidence)
+    values = confidence[mask]
+    if values.numel() and drop_quantile > 0:
+        threshold = torch.quantile(values.float(), drop_quantile).to(values.dtype)
+        mask &= confidence >= threshold
+    return mask
+
+
+def _unproject_world_points(
+    depth: Tensor,
+    valid_mask: Tensor,
+    intrinsics: Tensor,
+    camera_to_world: Tensor,
+) -> Tensor:
+    height, width = depth.shape
+    pixel_y, pixel_x = torch.meshgrid(
+        torch.arange(height, device=depth.device, dtype=depth.dtype),
+        torch.arange(width, device=depth.device, dtype=depth.dtype),
+        indexing="ij",
+    )
+    z = depth[valid_mask]
+    x = (pixel_x[valid_mask] - intrinsics[0, 2]) * z / intrinsics[0, 0]
+    y = (pixel_y[valid_mask] - intrinsics[1, 2]) * z / intrinsics[1, 1]
+    camera_points = torch.stack([x, y, z], dim=-1)
+    homogeneous = torch.cat(
+        [camera_points, torch.ones_like(camera_points[:, :1])], dim=-1
+    )
+    return (homogeneous @ camera_to_world.transpose(0, 1))[:, :3]
+
+
+def _directed_cross_view_frame_error(
+    source: GeometryOutput,
+    target: GeometryOutput,
+    source_intrinsics: Tensor,
+    target_intrinsics: Tensor,
+    source_camera_to_world: Tensor,
+    target_camera_to_world: Tensor,
+    frame_index: int,
+    input_size: Tuple[int, int],
+    config: GeometryRewardConfig,
+) -> Tuple[Optional[Tensor], Dict[str, Any]]:
+    source_depth = source.depths[frame_index]
+    target_depth = target.depths[frame_index]
+    source_mask = _depth_confidence_mask(
+        source, frame_index, config.confidence_drop_quantile
+    )
+    target_mask = _depth_confidence_mask(
+        target, frame_index, config.confidence_drop_quantile
+    )
+    source_count = int(source_mask.sum().item())
+    if source_count < config.min_valid_projected_pixels:
+        return None, {"source_pixels": source_count, "compared_pixels": 0}
+
+    source_k = _scaled_intrinsics(
+        source_intrinsics,
+        source_size=input_size,
+        target_size=tuple(source_depth.shape),
+    ).to(device=source_depth.device, dtype=source_depth.dtype)
+    target_k = _scaled_intrinsics(
+        target_intrinsics,
+        source_size=input_size,
+        target_size=tuple(target_depth.shape),
+    ).to(device=source_depth.device, dtype=source_depth.dtype)
+    source_camera_to_world = source_camera_to_world.to(
+        device=source_depth.device, dtype=source_depth.dtype
+    )
+    target_camera_to_world = target_camera_to_world.to(
+        device=source_depth.device, dtype=source_depth.dtype
+    )
+    world_points = _unproject_world_points(
+        source_depth,
+        source_mask,
+        source_k,
+        source_camera_to_world,
+    )
+    reprojected = _reproject_depth(
+        world_points,
+        target_camera_to_world,
+        target_k,
+        target_depth.shape[0],
+        target_depth.shape[1],
+        config.eps,
+    )
+    comparison_mask = target_mask & torch.isfinite(reprojected)
+    # A projected source surface behind the target depth is occluded in the
+    # target view.  Nearer conflicting surfaces remain and are penalized.
+    comparison_mask &= reprojected <= target_depth * (
+        1.0 + config.occlusion_relative_tolerance
+    )
+    compared_count = int(comparison_mask.sum().item())
+    if compared_count < config.min_valid_projected_pixels:
+        return None, {
+            "source_pixels": source_count,
+            "compared_pixels": compared_count,
+        }
+
+    relative_error = torch.abs(
+        reprojected[comparison_mask] - target_depth[comparison_mask]
+    ) / target_depth[comparison_mask].clamp_min(config.eps)
+    relative_error = relative_error.clamp_max(config.relative_error_cap)
+    return relative_error.mean(), {
+        "source_pixels": source_count,
+        "compared_pixels": compared_count,
+        "retained_pixels": int(relative_error.numel()),
+    }
+
+
+@torch.no_grad()
+def compute_cross_view_geometry_reward(
+    outputs: List[GeometryOutput],
+    camera_intrinsics: Tensor,
+    camera_to_world: Tensor,
+    input_size: Tuple[int, int],
+    config: GeometryRewardConfig,
+) -> CrossViewGeometryReward:
+    """Compare synchronized predicted depths in the calibrated world frame."""
+
+    device = outputs[0].depths.device
+    pair_names = [
+        (left, right)
+        for left in range(len(outputs))
+        for right in range(left + 1, len(outputs))
+    ]
+    pair_errors = torch.full(
+        (len(pair_names),), float("nan"), device=device, dtype=torch.float32
+    )
+    pair_valid_mask = torch.zeros(len(pair_names), device=device, dtype=torch.bool)
+    diagnostics: Dict[str, Any] = {"pair_order": pair_names, "pairs": {}}
+
+    for pair_index, (left, right) in enumerate(pair_names):
+        direction_errors: List[Tensor] = []
+        pair_diagnostics: Dict[str, Any] = {}
+        for source_index, target_index in ((left, right), (right, left)):
+            frame_errors: List[Tensor] = []
+            frame_diagnostics = []
+            for frame_index in range(outputs[source_index].depths.shape[0]):
+                error, details = _directed_cross_view_frame_error(
+                    source=outputs[source_index],
+                    target=outputs[target_index],
+                    source_intrinsics=camera_intrinsics[source_index, frame_index],
+                    target_intrinsics=camera_intrinsics[target_index, frame_index],
+                    source_camera_to_world=camera_to_world[
+                        source_index, frame_index
+                    ],
+                    target_camera_to_world=camera_to_world[
+                        target_index, frame_index
+                    ],
+                    frame_index=frame_index,
+                    input_size=input_size,
+                    config=config,
+                )
+                frame_diagnostics.append(details)
+                if error is not None:
+                    frame_errors.append(error)
+            direction_name = f"{source_index}->{target_index}"
+            pair_diagnostics[direction_name] = {
+                "valid_frames": len(frame_errors),
+                "frames": frame_diagnostics,
+            }
+            if len(frame_errors) >= config.min_valid_cross_view_frames:
+                stacked_frame_errors = torch.stack(frame_errors)
+                worst_count = min(
+                    config.topk_worst_frames, stacked_frame_errors.numel()
+                )
+                direction_errors.append(
+                    torch.topk(
+                        stacked_frame_errors, k=worst_count, largest=True
+                    ).values.mean()
+                )
+                pair_diagnostics[direction_name]["worst_frame_count"] = (
+                    worst_count
+                )
+
+        diagnostics["pairs"][f"{left}-{right}"] = pair_diagnostics
+        # Occlusion and unequal fields of view can make only one direction
+        # usable.  Average every usable direction instead of discarding the
+        # whole camera pair.
+        if direction_errors:
+            pair_errors[pair_index] = torch.stack(direction_errors).mean()
+            pair_valid_mask[pair_index] = True
+
+    valid_pair_count = int(pair_valid_mask.sum().item())
+    minimum_pair_count = max(1, len(outputs) - 1)
+    diagnostics["valid_pair_count"] = valid_pair_count
+    diagnostics["minimum_pair_count"] = minimum_pair_count
+    if valid_pair_count < minimum_pair_count:
+        diagnostics.update(
+            {
+                "invalid_code": "insufficient_cross_view_overlap",
+                "invalid_reason": (
+                    f"only {valid_pair_count} camera pairs have shared visibility; "
+                    f"need at least {minimum_pair_count}"
+                ),
+            }
+        )
+        return CrossViewGeometryReward(
+            reward=pair_errors.new_tensor(float("nan")),
+            valid=False,
+            pair_errors=pair_errors,
+            pair_valid_mask=pair_valid_mask,
+            diagnostics=diagnostics,
+        )
+
+    valid_pair_errors = pair_errors[pair_valid_mask]
+    mean_error = valid_pair_errors.mean()
+    worst_error = valid_pair_errors.max()
+    final_error = (
+        config.cross_view_mean_weight * mean_error
+        + config.cross_view_worst_weight * worst_error
+    )
+    diagnostics.update(
+        {
+            "mean_pair_error": mean_error,
+            "worst_pair_error": worst_error,
+            "cross_view_error": final_error,
+            "dynamic_points_filtered": False,
+        }
+    )
+    return CrossViewGeometryReward(
+        reward=-final_error,
+        valid=True,
+        pair_errors=pair_errors,
+        pair_valid_mask=pair_valid_mask,
+        diagnostics=diagnostics,
+    )
+
+
+def _prepare_calibrations(
+    videos: Tensor,
+    camera_intrinsics: Optional[Tensor],
+    camera_to_world: Optional[Tensor],
+) -> Tuple[Optional[Tensor], Optional[Tensor], Optional[str]]:
+    if camera_intrinsics is None or camera_to_world is None:
+        return None, None, "camera intrinsics and camera-to-world transforms are required"
+
+    if videos.ndim == 6:
+        _, num_views, num_frames = videos.shape[:3]
+        if camera_intrinsics.ndim == 3:
+            camera_intrinsics = camera_intrinsics[:, None].expand(
+                -1, num_frames, -1, -1
+            )
+        if camera_intrinsics.shape != (num_views, num_frames, 3, 3):
+            return None, None, (
+                "unbatched intrinsics must be [V,3,3] or [V,T,3,3], got "
+                f"{tuple(camera_intrinsics.shape)}"
+            )
+        if camera_to_world.shape != (num_views, num_frames, 4, 4):
+            return None, None, (
+                "unbatched camera_to_world must be [V,T,4,4], got "
+                f"{tuple(camera_to_world.shape)}"
+            )
+        camera_intrinsics = camera_intrinsics.unsqueeze(0)
+        camera_to_world = camera_to_world.unsqueeze(0)
+    else:
+        batch_size, _, num_views, num_frames = videos.shape[:4]
+        if camera_intrinsics.ndim == 4:
+            camera_intrinsics = camera_intrinsics[:, :, None].expand(
+                -1, -1, num_frames, -1, -1
+            )
+        if camera_intrinsics.shape != (batch_size, num_views, num_frames, 3, 3):
+            return None, None, (
+                "batched intrinsics must be [B,V,3,3] or [B,V,T,3,3], got "
+                f"{tuple(camera_intrinsics.shape)}"
+            )
+        if camera_to_world.shape != (batch_size, num_views, num_frames, 4, 4):
+            return None, None, (
+                "batched camera_to_world must be [B,V,T,4,4], got "
+                f"{tuple(camera_to_world.shape)}"
+            )
+
+    camera_intrinsics = camera_intrinsics.to(
+        device=videos.device, dtype=torch.float32
+    )
+    camera_to_world = camera_to_world.to(
+        device=videos.device, dtype=torch.float32
+    )
+    if not torch.isfinite(camera_intrinsics).all():
+        return None, None, "camera intrinsics contain NaN or Inf"
+    if not torch.isfinite(camera_to_world).all():
+        return None, None, "camera_to_world contains NaN or Inf"
+    focal_lengths = camera_intrinsics[..., (0, 1), (0, 1)]
+    if (focal_lengths <= 0).any():
+        return None, None, "camera focal lengths must be positive"
+    determinants = torch.linalg.det(camera_to_world)
+    if (determinants.abs() <= 1.0e-8).any():
+        return None, None, "camera_to_world contains a singular transform"
+    return camera_intrinsics, camera_to_world, None
+
+
 @torch.no_grad()
 def compute_geometry_rewards(
     videos: Tensor,
     adapter: GeometryAdapter,
     config: GeometryRewardConfig,
+    camera_intrinsics: Optional[Tensor] = None,
+    camera_to_world: Optional[Tensor] = None,
 ) -> GeometryRewardOutput:
-    """Compute independent per-view and view-averaged geometry rewards.
-
-    Args:
-        videos: RGB videos shaped ``[K, V, T, C, H, W]`` or
-            ``[B, K, V, T, C, H, W]``.  Dimensions are never inferred by
-            reshaping: ``K`` is GRPO group size, ``V`` is number of views,
-            and ``T`` is number of future frames used by the reward.
-        adapter: Frozen geometry backend called once per candidate/view with a
-            tensor shaped ``[T, C, H, W]``.
-        config: Geometry reward and validity thresholds.
-
-    A candidate is valid only when every configured view is valid.  Invalid
-    views are never dropped from the equal-view average.
-    """
+    """Compute temporal Any4D plus calibrated synchronous cross-view reward."""
 
     if videos.ndim == 6:
         batched_videos = videos.unsqueeze(0)
@@ -825,8 +1127,10 @@ def compute_geometry_rewards(
         )
 
     batch_size, group_size, num_views = batched_videos.shape[:3]
+    num_pairs = num_views * (num_views - 1) // 2
     output_shape = (batch_size, group_size)
     per_view_shape = (batch_size, group_size, num_views)
+    per_pair_shape = (batch_size, group_size, num_pairs)
     per_view_reward = torch.full(
         per_view_shape,
         float("nan"),
@@ -835,6 +1139,15 @@ def compute_geometry_rewards(
     )
     per_view_valid_mask = torch.zeros(
         per_view_shape, dtype=torch.bool, device=videos.device
+    )
+    per_pair_reward = torch.full(
+        per_pair_shape,
+        float("nan"),
+        dtype=torch.float32,
+        device=videos.device,
+    )
+    per_pair_valid_mask = torch.zeros(
+        per_pair_shape, dtype=torch.bool, device=videos.device
     )
     geometry_reward = torch.full(
         output_shape,
@@ -846,17 +1159,33 @@ def compute_geometry_rewards(
     diagnostics: Dict[str, Any] = {
         "input_shape": tuple(videos.shape),
         "invalid_views": [],
+        "invalid_candidates": [],
         "per_view": {},
+        "per_candidate": {},
+        "pair_order": [
+            (left, right)
+            for left in range(num_views)
+            for right in range(left + 1, num_views)
+        ],
     }
+    prepared_intrinsics, prepared_camera_to_world, calibration_error = (
+        _prepare_calibrations(videos, camera_intrinsics, camera_to_world)
+    )
 
     if num_views != config.num_views:
         diagnostics["invalid_code"] = "view_count_mismatch"
         diagnostics["invalid_reason"] = (
             f"expected {config.num_views} views, got {num_views}"
         )
+    elif calibration_error is not None:
+        diagnostics["invalid_code"] = "invalid_cross_view_calibration"
+        diagnostics["invalid_reason"] = calibration_error
     else:
+        assert prepared_intrinsics is not None
+        assert prepared_camera_to_world is not None
         for batch_index in range(batch_size):
             for candidate_index in range(group_size):
+                candidate_outputs: List[GeometryOutput] = []
                 for view_index in range(num_views):
                     diagnostic_key = (
                         f"batch{batch_index}/candidate{candidate_index}/view{view_index}"
@@ -867,7 +1196,7 @@ def compute_geometry_rewards(
                     try:
                         geometry = adapter.infer(video)
                         view_result = compute_single_view_geometry_reward(
-                            geometry, config, video=video
+                            geometry, config
                         )
                     except Exception as error:
                         diagnostics["invalid_views"].append(
@@ -901,9 +1230,16 @@ def compute_geometry_rewards(
                         )
                         continue
 
+                    candidate_outputs.append(geometry)
+                    normalized_temporal_reward = (
+                        view_result.reward / config.static_error_scale
+                    )
+                    view_result.diagnostics["static_normalized_error"] = (
+                        -normalized_temporal_reward
+                    )
                     per_view_reward[
                         batch_index, candidate_index, view_index
-                    ] = view_result.reward.to(
+                    ] = normalized_temporal_reward.to(
                         device=videos.device, dtype=torch.float32
                     )
                     per_view_valid_mask[
@@ -913,20 +1249,74 @@ def compute_geometry_rewards(
                 candidate_views_valid = per_view_valid_mask[
                     batch_index, candidate_index
                 ].all()
-                if bool(candidate_views_valid.item()):
-                    geometry_reward[batch_index, candidate_index] = per_view_reward[
-                        batch_index, candidate_index
-                    ].mean()
-                    valid_mask[batch_index, candidate_index] = True
+                if not bool(candidate_views_valid.item()):
+                    continue
+
+                candidate_key = f"batch{batch_index}/candidate{candidate_index}"
+                cross_view = compute_cross_view_geometry_reward(
+                    outputs=candidate_outputs,
+                    camera_intrinsics=prepared_intrinsics[batch_index],
+                    camera_to_world=prepared_camera_to_world[batch_index],
+                    input_size=tuple(batched_videos.shape[-2:]),
+                    config=config,
+                )
+                diagnostics["per_candidate"][candidate_key] = cross_view.diagnostics
+                per_pair_reward[batch_index, candidate_index] = (
+                    -cross_view.pair_errors
+                )
+                per_pair_valid_mask[batch_index, candidate_index] = (
+                    cross_view.pair_valid_mask
+                )
+                if not cross_view.valid:
+                    diagnostics["invalid_candidates"].append(
+                        {
+                            "batch_index": batch_index,
+                            "candidate_index": candidate_index,
+                            "code": cross_view.diagnostics.get(
+                                "invalid_code", "invalid_cross_view_geometry"
+                            ),
+                            "reason": cross_view.diagnostics.get(
+                                "invalid_reason", "unknown cross-view geometry error"
+                            ),
+                        }
+                    )
+                    continue
+
+                temporal_error = -per_view_reward[
+                    batch_index, candidate_index
+                ].mean()
+                cross_view_error = -cross_view.reward
+                final_error = (
+                    config.temporal_weight * temporal_error
+                    + config.cross_view_weight * cross_view_error
+                )
+                geometry_reward[batch_index, candidate_index] = -final_error
+                valid_mask[batch_index, candidate_index] = True
+                diagnostics["per_candidate"][candidate_key].update(
+                    {
+                        "reward_version": "geometry_v2_calibrated_cross_view",
+                        "temporal_error": temporal_error,
+                        "final_geometry_error": final_error,
+                        "temporal_weight": config.temporal_weight,
+                        "cross_view_weight": config.cross_view_weight,
+                    }
+                )
 
     diagnostics["valid_rate"] = float(valid_mask.float().mean().item())
     diagnostics["per_view_valid_rate"] = [
         float(per_view_valid_mask[..., view_index].float().mean().item())
         for view_index in range(num_views)
     ]
+    diagnostics["per_pair_valid_rate"] = [
+        float(per_pair_valid_mask[..., pair_index].float().mean().item())
+        for pair_index in range(num_pairs)
+    ]
     invalid_reason_counts: Dict[str, int] = {}
     for invalid_view in diagnostics["invalid_views"]:
         code = invalid_view["code"]
+        invalid_reason_counts[code] = invalid_reason_counts.get(code, 0) + 1
+    for invalid_candidate in diagnostics["invalid_candidates"]:
+        code = invalid_candidate["code"]
         invalid_reason_counts[code] = invalid_reason_counts.get(code, 0) + 1
     if "invalid_code" in diagnostics:
         code = diagnostics["invalid_code"]
@@ -938,12 +1328,16 @@ def compute_geometry_rewards(
         per_view_reward = per_view_reward.squeeze(0)
         valid_mask = valid_mask.squeeze(0)
         per_view_valid_mask = per_view_valid_mask.squeeze(0)
+        per_pair_reward = per_pair_reward.squeeze(0)
+        per_pair_valid_mask = per_pair_valid_mask.squeeze(0)
 
     return GeometryRewardOutput(
         geometry_reward=geometry_reward,
         per_view_reward=per_view_reward,
         valid_mask=valid_mask,
         per_view_valid_mask=per_view_valid_mask,
+        per_pair_reward=per_pair_reward,
+        per_pair_valid_mask=per_pair_valid_mask,
         diagnostics=diagnostics,
     )
 
@@ -997,6 +1391,8 @@ def compute_vggrpo_reward_components(
     adapter: GeometryAdapter,
     geometry_config: GeometryRewardConfig,
     motion_config: CameraMotionRewardConfig,
+    camera_intrinsics: Optional[Tensor] = None,
+    camera_to_world: Optional[Tensor] = None,
 ) -> VGGRPORewardComponents:
     """Compute motion and geometry while invoking the heavy adapter only once."""
 
@@ -1010,6 +1406,8 @@ def compute_vggrpo_reward_components(
         videos=videos,
         adapter=recording_adapter,
         config=geometry_config,
+        camera_intrinsics=camera_intrinsics,
+        camera_to_world=camera_to_world,
     )
     replay_adapter = _ReplayGeometryAdapter(recording_adapter.records)
     motion = compute_camera_motion_rewards(
@@ -1250,6 +1648,13 @@ def assemble_reward_output(
                 motion_output.per_view_valid_mask[..., view_index],
             )
             diagnostics[f"reward/view{view_index}_motion"] = view_motion_mean
+    num_pairs = geometry_output.per_pair_reward.shape[-1]
+    for pair_index in range(num_pairs):
+        pair_mean, _ = _masked_mean_std(
+            geometry_output.per_pair_reward[..., pair_index],
+            geometry_output.per_pair_valid_mask[..., pair_index],
+        )
+        diagnostics[f"reward/pair{pair_index}_geo"] = pair_mean
 
     return RewardOutput(
         motion_reward=motion_reward,
@@ -1269,6 +1674,8 @@ def assemble_reward_output(
         ),
         per_view_geometry_reward=geometry_output.per_view_reward,
         per_view_valid_mask=geometry_output.per_view_valid_mask,
+        per_pair_geometry_reward=geometry_output.per_pair_reward,
+        per_pair_geometry_valid_mask=geometry_output.per_pair_valid_mask,
         diagnostics=diagnostics,
     )
 
@@ -1280,6 +1687,8 @@ def compute_vggrpo_reward(
     geometry_config: GeometryRewardConfig,
     motion_config: CameraMotionRewardConfig,
     normalization_config: GroupNormalizationConfig,
+    camera_intrinsics: Optional[Tensor] = None,
+    camera_to_world: Optional[Tensor] = None,
 ) -> RewardOutput:
     """Training-facing full VGGRPO-style RGB reward entry point."""
 
@@ -1288,6 +1697,8 @@ def compute_vggrpo_reward(
         adapter=adapter,
         geometry_config=geometry_config,
         motion_config=motion_config,
+        camera_intrinsics=camera_intrinsics,
+        camera_to_world=camera_to_world,
     )
     return assemble_reward_output(
         motion_reward=components.motion.motion_reward,

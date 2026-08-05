@@ -1,33 +1,41 @@
 {
-  "name": "geometry_v2_frozen_2026_08_05",
-  "purpose": "ranking validation only; no model updates and no claim of model improvement",
+  "name": "geometry_v2_calibrated_cross_view_2026_08_05",
+  "purpose": "trainable multi-view geometry reward and ranking validation",
   "source_sha256": {
-    "rewards/vggrpo_reward.py": "6c571465bd9f0314b9749057b6a6064288ff937c8daac5590a7b8a3e5b90df38",
-    "rewards/rgb_temporal_consistency.py": "f4815be5557ab0c5b247f3e348361fc57671a22b243d6a9daa74ff0db8da64a6"
+    "rewards/vggrpo_reward.py": "cdd117964e378729f2cc4362ddc2c6e7150926390433a1a634d953415c773695",
+    "rewards/any4d_adapter.py": "3bca7d75c61d35a44c2012f977229044c6d395edc43cae97b4d326a037079c21",
+    "rewards/geometry_adapter.py": "27af66b20b85a25177466e04da644a1895e72f978c8bfeec03926789f379408a",
+    "data/agibotworld_dataset.py": "3c5cb20f79ea28f2cf2c698052a58bc0bc857a84d60338e5af7cfe43d65e81a8"
   },
   "frame_schedule_zero_based": [4, 10, 15, 18, 20, 25, 28],
   "geometry": {
     "num_views": 3,
-    "topk_worst_frames_or_pairs": 3,
+    "temporal_any4d_weight": 0.25,
+    "cross_view_depth_weight": 0.75,
+    "cross_view_mean_pair_weight": 0.5,
+    "cross_view_worst_pair_weight": 0.5,
+    "topk_worst_frames": 3,
     "min_valid_projected_pixels": 128,
-    "static_flow_threshold": 0.03,
-    "rgb_temporal_weight": 0.75,
-    "any4d_static_weight": 0.25,
-    "static_error_scale": 0.2,
-    "rgb_resize_long_side": 160,
-    "min_rgb_temporal_frames": 7,
-    "rgb_reference_scales": {
-      "cycle_q90": 0.001,
-      "photometric_mean": 0.02,
-      "strain_q95": 0.3
-    }
+    "min_valid_cross_view_frames": 3,
+    "minimum_valid_camera_pairs": 2,
+    "confidence_drop_quantile": 0.2,
+    "occlusion_relative_tolerance": 0.05,
+    "relative_error_cap": 1.0,
+    "static_flow_threshold_temporal_only": 0.03,
+    "dynamic_points_filtered_cross_view": false,
+    "required_calibration": "camera intrinsics [V,3,3] and camera-to-world [V,T,4,4]"
   },
   "group_combination": {
     "motion_weight": 0.1,
     "geometry_weight": 0.9,
-    "normalization": "motion and geometry separately z-normalized within condition candidate group"
+    "normalization": "motion and geometry separately z-normalized within each candidate group"
   },
-  "aggregation": "score each camera independently, then arithmetic mean over head/hand_left/hand_right",
-  "claim_boundary": "validates aggregate multi-view video quality and per-view temporal consistency, not true cross-view geometric consistency",
-  "freeze_rule": "All values and source hashes above must remain unchanged throughout held-out and generated-candidate validation."
+  "evaluation_only": [
+    "mean multi-view PSNR",
+    "worst-view PSNR",
+    "head minus mean hand-view PSNR gap",
+    "SSIM",
+    "LPIPS"
+  ],
+  "claim_boundary": "Directly scores calibrated synchronous depth consistency. It does not score action following, RGB correspondence, or long-range tracking."
 }

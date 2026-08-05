@@ -36,6 +36,9 @@ class GeometryOutput:
             reference-frame point grid used by ``point_maps`` and
             ``scene_flows``.  If omitted, reward code falls back to
             ``valid_mask`` for backward-compatible mock adapters.
+        confidence: optional ``[T, H, W]`` geometry confidence.  Cross-view
+            reprojection drops the configured low-confidence quantile when
+            this field is available.
         diagnostics: backend-specific, lightweight diagnostic values.
 
     ``T`` must match the number of frames passed to ``GeometryAdapter.infer``.
@@ -50,6 +53,7 @@ class GeometryOutput:
     valid_mask: Tensor
     intrinsics: Optional[Tensor] = None
     point_valid_mask: Optional[Tensor] = None
+    confidence: Optional[Tensor] = None
     diagnostics: Dict[str, Any] = field(default_factory=dict)
 
 

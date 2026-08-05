@@ -359,6 +359,7 @@ class Any4DGeometryAdapter(GeometryAdapter):
         camera_poses: List[Tensor] = []
         depths: List[Tensor] = []
         intrinsics: List[Tensor] = []
+        confidences: List[Tensor] = []
         for frame_index, prediction in enumerate(per_frame_predictions):
             quaternion = _remove_singleton_batch(
                 prediction["cam_quats"], f"pred{frame_index + 1}.cam_quats"
@@ -398,6 +399,12 @@ class Any4DGeometryAdapter(GeometryAdapter):
             intrinsics.append(
                 self._recover_intrinsics_fn(ray_directions).float()
             )
+            if "conf" in prediction:
+                confidences.append(
+                    _remove_singleton_batch(
+                        prediction["conf"], f"pred{frame_index + 1}.conf"
+                    )
+                )
 
         stacked_depths = torch.stack(depths)
         # Any4D scene flow and the derived point maps live on frame 0's
@@ -420,6 +427,11 @@ class Any4DGeometryAdapter(GeometryAdapter):
             valid_mask=depth_valid_mask,
             intrinsics=torch.stack(intrinsics),
             point_valid_mask=point_valid_mask,
+            confidence=(
+                torch.stack(confidences)
+                if len(confidences) == num_frames
+                else None
+            ),
             diagnostics={
                 "backend": "any4d_rgb_4d_model",
                 "input_shape": input_shape,
