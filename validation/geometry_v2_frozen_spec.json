@@ -1,0 +1,33 @@
+{
+  "name": "geometry_v2_frozen_2026_08_05",
+  "purpose": "ranking validation only; no model updates and no claim of model improvement",
+  "source_sha256": {
+    "rewards/vggrpo_reward.py": "6c571465bd9f0314b9749057b6a6064288ff937c8daac5590a7b8a3e5b90df38",
+    "rewards/rgb_temporal_consistency.py": "f4815be5557ab0c5b247f3e348361fc57671a22b243d6a9daa74ff0db8da64a6"
+  },
+  "frame_schedule_zero_based": [4, 10, 15, 18, 20, 25, 28],
+  "geometry": {
+    "num_views": 3,
+    "topk_worst_frames_or_pairs": 3,
+    "min_valid_projected_pixels": 128,
+    "static_flow_threshold": 0.03,
+    "rgb_temporal_weight": 0.75,
+    "any4d_static_weight": 0.25,
+    "static_error_scale": 0.2,
+    "rgb_resize_long_side": 160,
+    "min_rgb_temporal_frames": 7,
+    "rgb_reference_scales": {
+      "cycle_q90": 0.001,
+      "photometric_mean": 0.02,
+      "strain_q95": 0.3
+    }
+  },
+  "group_combination": {
+    "motion_weight": 0.1,
+    "geometry_weight": 0.9,
+    "normalization": "motion and geometry separately z-normalized within condition candidate group"
+  },
+  "aggregation": "score each camera independently, then arithmetic mean over head/hand_left/hand_right",
+  "claim_boundary": "validates aggregate multi-view video quality and per-view temporal consistency, not true cross-view geometric consistency",
+  "freeze_rule": "All values and source hashes above must remain unchanged throughout held-out and generated-candidate validation."
+}

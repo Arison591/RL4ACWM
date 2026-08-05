@@ -192,3 +192,19 @@ __pycache__/
 # Environment and editor files
 .env
 .vscode/
+
+# Local datasets and generated experiment artifacts
+/data/agibotworld_beta/
+/data/ood/
+/outputs/
+
+# Geometry-v2 keeps only the frozen contract and final objective summaries in Git.
+/validation/geometry_v2_v1/*
+!/validation/geometry_v2_v1/heldout_analysis.json
+!/validation/geometry_v2_v1/candidate_ranking_analysis.json
+
+# Local tooling used to produce the non-release Geometry-v2 audit.
+/data_tools/
+/evaluation/
+/scripts/*geometry_v2*.py
+/tests/
