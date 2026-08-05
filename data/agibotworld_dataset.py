@@ -497,6 +497,8 @@ class AgiBotWorld(Dataset):
 
         sample = dict(
             video=video,
+            intrinsics=intrinsics,
+            camera_to_world=extrinsics,
             actions=actions,
             state=state,
             caption=caption,
