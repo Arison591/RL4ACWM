@@ -45,3 +45,24 @@ def test_bundled_credentials_are_used_without_environment(monkeypatch, tmp_path)
     assert calls["init"]["mode"] == "online"
     assert monitor.run is not None
     monitor.finish()
+
+
+def test_legacy_short_entity_is_repaired(monkeypatch, tmp_path):
+    calls = {}
+    fake_wandb = types.ModuleType("wandb")
+    fake_wandb.login = lambda **kwargs: True
+    fake_wandb.Settings = lambda **kwargs: kwargs
+
+    def init(**kwargs):
+        calls.update(kwargs)
+        return _FakeRun()
+
+    fake_wandb.init = init
+    monkeypatch.setitem(sys.modules, "wandb", fake_wandb)
+    monkeypatch.setenv("WANDB_ENTITY", "hrqian06")
+    monkeypatch.delenv("WANDB_MODE", raising=False)
+
+    monitor = wandb_monitor.WandbMonitor({}, tmp_path)
+
+    assert calls["entity"] == wandb_monitor._BUNDLED_WANDB_ENTITY
+    monitor.finish()

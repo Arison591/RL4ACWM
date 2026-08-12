@@ -10,6 +10,15 @@ from typing import Any, Iterable
 # 远端训练交付使用的 W&B 凭据；环境变量 WANDB_API_KEY 仍可覆盖以便轮换。
 _BUNDLED_WANDB_API_KEY = "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"
 _BUNDLED_WANDB_ENTITY = "hrqian06-huazhong-university-of-science-and-technology"
+_LEGACY_INVALID_WANDB_ENTITIES = {"hrqian06"}
+
+
+def _resolve_wandb_entity() -> str:
+    """Use the verified team slug and repair the legacy short user entity."""
+    configured = os.environ.get("WANDB_ENTITY", "").strip()
+    if not configured or configured in _LEGACY_INVALID_WANDB_ENTITIES:
+        return _BUNDLED_WANDB_ENTITY
+    return configured
 
 
 def _finite(values: Iterable[Any]) -> list[float]:
@@ -74,7 +83,7 @@ class WandbMonitor:
                     init_timeout=max(int(os.environ.get("WANDB_INIT_TIMEOUT", "15")), 1),
                 ),
             }
-            entity = os.environ.get("WANDB_ENTITY", _BUNDLED_WANDB_ENTITY).strip()
+            entity = _resolve_wandb_entity()
             run_id = os.environ.get("WANDB_RUN_ID")
             if entity:
                 init_kwargs["entity"] = entity

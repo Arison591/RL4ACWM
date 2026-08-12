@@ -19,7 +19,9 @@ ROLLOUT_RETENTION="${ROLLOUT_RETENTION:-videos}"
 RESUME_CHECKPOINT="${RESUME_CHECKPOINT:-}"
 export WANDB_MODE="${WANDB_MODE:-online}"
 export WANDB_PROJECT="${WANDB_PROJECT:-awm-coca}"
-export WANDB_ENTITY="${WANDB_ENTITY:-hrqian06-huazhong-university-of-science-and-technology}"
+# 该 key 已验证只能向下面的 Team entity 写入。覆盖终端残留的旧值
+# WANDB_ENTITY=hrqian06，避免 W&B upsertBucket 初始化失败。
+export WANDB_ENTITY="hrqian06-huazhong-university-of-science-and-technology"
 export WANDB_VIDEO_EVERY="${WANDB_VIDEO_EVERY:-50}"
 export WANDB_VIDEO_SAMPLES="${WANDB_VIDEO_SAMPLES:-1}"
 export WANDB_INIT_TIMEOUT="${WANDB_INIT_TIMEOUT:-15}"

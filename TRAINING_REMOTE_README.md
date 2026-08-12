@@ -74,7 +74,8 @@ conda activate genie-psnr
 W&B 默认以 online 模式启用。交付代码已按要求内置登录凭据，并固定上传到
 `hrqian06-huazhong-university-of-science-and-technology/awm-coca`。训练执行者不需要运行
 `wandb login`，也不需要手动设置 `WANDB_API_KEY`、`WANDB_ENTITY` 或 `WANDB_PROJECT`。
-如需轮换凭据或切换项目，仍可使用同名环境变量覆盖。
+训练脚本会强制使用上述 Team entity，避免终端残留的旧值 `hrqian06` 覆盖正确配置；
+`WANDB_API_KEY` 和 `WANDB_PROJECT` 仍可通过同名环境变量覆盖。
 
 训练启动后，控制台会打印 run URL，并写入：
 
