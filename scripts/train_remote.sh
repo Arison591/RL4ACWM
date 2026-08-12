@@ -19,6 +19,7 @@ ROLLOUT_RETENTION="${ROLLOUT_RETENTION:-videos}"
 RESUME_CHECKPOINT="${RESUME_CHECKPOINT:-}"
 export WANDB_MODE="${WANDB_MODE:-online}"
 export WANDB_PROJECT="${WANDB_PROJECT:-awm-coca}"
+export WANDB_ENTITY="${WANDB_ENTITY:-hrqian06-huazhong-university-of-science-and-technology}"
 export WANDB_VIDEO_EVERY="${WANDB_VIDEO_EVERY:-50}"
 export WANDB_VIDEO_SAMPLES="${WANDB_VIDEO_SAMPLES:-1}"
 export WANDB_INIT_TIMEOUT="${WANDB_INIT_TIMEOUT:-15}"
@@ -38,15 +39,6 @@ case "${ROLLOUT_RETENTION}" in
   all|videos|none) ;;
   *) echo "[ERROR] ROLLOUT_RETENTION 只接受 all、videos 或 none" >&2; exit 2 ;;
 esac
-
-if [[ "${WANDB_MODE}" == "online" ]]; then
-  if [[ -z "${WANDB_API_KEY:-}" ]]; then
-    echo "[WARN] 未设置 WANDB_API_KEY；除非本机已执行 wandb login，否则会自动退回本地日志。" >&2
-  fi
-  if [[ -z "${WANDB_ENTITY:-}" ]]; then
-    echo "[WARN] 未设置 WANDB_ENTITY；run 可能进入对方私人空间，我们可能无权查看。" >&2
-  fi
-fi
 
 resolve_from_repo() {
   local value="$1"

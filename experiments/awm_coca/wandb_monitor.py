@@ -7,6 +7,11 @@ from pathlib import Path
 from typing import Any, Iterable
 
 
+# 远端训练交付使用的 W&B 凭据；环境变量 WANDB_API_KEY 仍可覆盖以便轮换。
+_BUNDLED_WANDB_API_KEY = "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"
+_BUNDLED_WANDB_ENTITY = "hrqian06-huazhong-university-of-science-and-technology"
+
+
 def _finite(values: Iterable[Any]) -> list[float]:
     result = []
     for value in values:
@@ -53,6 +58,11 @@ class WandbMonitor:
             import wandb
 
             self.wandb = wandb
+            api_key = os.environ.get("WANDB_API_KEY") or _BUNDLED_WANDB_API_KEY
+            if mode == "online":
+                logged_in = wandb.login(key=api_key, relogin=True)
+                if logged_in is False:
+                    raise RuntimeError("wandb.login returned False")
             init_kwargs: dict[str, Any] = {
                 "project": os.environ.get("WANDB_PROJECT", "awm-coca"),
                 "name": os.environ.get("WANDB_NAME") or None,
@@ -64,7 +74,7 @@ class WandbMonitor:
                     init_timeout=max(int(os.environ.get("WANDB_INIT_TIMEOUT", "15")), 1),
                 ),
             }
-            entity = os.environ.get("WANDB_ENTITY")
+            entity = os.environ.get("WANDB_ENTITY", _BUNDLED_WANDB_ENTITY).strip()
             run_id = os.environ.get("WANDB_RUN_ID")
             if entity:
                 init_kwargs["entity"] = entity

@@ -16,9 +16,6 @@ conda activate genie-psnr
 
 bash scripts/download_models.sh
 
-# W&B 网页实时监控；使用训练执行者自己的 API key
-export WANDB_API_KEY=<对方自己的 W&B API key>
-export WANDB_ENTITY=<双方都能访问的 team 或用户名>
 bash scripts/train_remote.sh
 ```
 
@@ -74,16 +71,10 @@ conda activate genie-psnr
 
 ## 2. W&B 实时训练日志
 
-W&B 默认启用。训练执行者先设置自己的 API key：
-
-> 训练本身不依赖 W&B，不设置也能跑并保存本地日志；但如果希望我们实时看到网页曲线，
-> 对方必须在训练机设置下面三项。API key 只留在对方机器，不要写进代码、README 或日志。
-
-```bash
-export WANDB_API_KEY=<对方自己的 W&B API key>
-export WANDB_ENTITY=<双方都能访问的 team 或用户名>
-export WANDB_PROJECT=awm-coca
-```
+W&B 默认以 online 模式启用。交付代码已按要求内置登录凭据，并固定上传到
+`hrqian06-huazhong-university-of-science-and-technology/awm-coca`。训练执行者不需要运行
+`wandb login`，也不需要手动设置 `WANDB_API_KEY`、`WANDB_ENTITY` 或 `WANDB_PROJECT`。
+如需轮换凭据或切换项目，仍可使用同名环境变量覆盖。
 
 训练启动后，控制台会打印 run URL，并写入：
 
@@ -110,10 +101,6 @@ WANDB_MODE=disabled bash scripts/train_remote.sh
 
 断网环境也可设置 `WANDB_MODE=offline`，之后在训练机器上手动同步。checkpoint 不上传
 W&B，训练完成后仍按第 9 节打包回传。
-
-如果不提供 `WANDB_API_KEY`，我们无法从网页实时查看曲线；此时只能在训练机查看
-`metrics/train.jsonl` 和控制台日志，或者训练后再同步。因此正式启动前建议把可写入
-`hrqian06/awm-coca` 的 key 通过私聊发给执行者，并让他执行上面的三条 `export`。
 
 ## 3. 数据目录
 
