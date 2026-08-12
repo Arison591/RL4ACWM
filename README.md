@@ -111,6 +111,10 @@ WANDB_MODE=disabled bash scripts/train_remote.sh
 断网环境也可设置 `WANDB_MODE=offline`，之后在训练机器上手动同步。checkpoint 不上传
 W&B，训练完成后仍按第 9 节打包回传。
 
+如果不提供 `WANDB_API_KEY`，我们无法从网页实时查看曲线；此时只能在训练机查看
+`metrics/train.jsonl` 和控制台日志，或者训练后再同步。因此正式启动前建议把可写入
+`hrqian06/awm-coca` 的 key 通过私聊发给执行者，并让他执行上面的三条 `export`。
+
 ## 3. 数据目录
 
 目标训练机的数据根目录为：
@@ -275,6 +279,11 @@ ROLLOUT_RETENTION=none bash scripts/train_remote.sh
 
 ## 7. 输出、日志和 checkpoint
 
+默认训练长度是 `1000` 次 optimizer update，不是整数 epoch。当前数据预检得到 203 个
+condition，且梯度累积为 1，所以 1 epoch = 203 次 update，全部训练约为 4.93 epochs。
+命令行会显示仅 rank 0 输出的总进度条，其中包含 `step/1000`、epoch、condition、当前
+阶段（rollout/reward/update）、loss、reward、单步耗时以及动态 ETA，不会由四张卡重复刷屏。
+
 目标训练机默认输出（其他机器以启动时打印的 `output_dir` 为准）：
 
 ```text
@@ -298,6 +307,7 @@ ROLLOUT_RETENTION=none bash scripts/train_remote.sh
 
 ```bash
 tail -f /hpc2hdd/home/bohantan/jhupload/hr_data/awm_coca_outputs/logs/train_*.log
+tail -f /hpc2hdd/home/bohantan/jhupload/hr_data/awm_coca_outputs/metrics/train.jsonl
 nvidia-smi
 watch -n 30 df -h
 ```

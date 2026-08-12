@@ -7,6 +7,7 @@ import os
 import random
 import shutil
 import sys
+import time
 from datetime import datetime
 from pathlib import Path
 from typing import Any
@@ -22,6 +23,7 @@ import torch.distributed as dist
 import yaml
 import numpy as np
 from torch.utils.data import DataLoader
+from tqdm.auto import tqdm
 
 from experiments.awm_coca.async_reward import AsyncRewardRunner, RewardRequest
 from experiments.awm_coca.checkpointing import load_checkpoint, restore_rng_state, save_checkpoint
@@ -490,12 +492,29 @@ def train(config: dict[str, Any], *, resume: str | None = None, device: str = "c
     logger = JsonlMetricLogger(output / "metrics" / "train.jsonl") if rank == 0 else None
     rollout_logger = JsonlMetricLogger(output / "metrics" / "rollouts.jsonl") if rank == 0 else None
     max_steps = int(config["max_optimizer_steps"])
+    conditions_per_epoch = len(sampler)
+    accumulation_steps = int(optimizer_config["gradient_accumulation_steps"])
+    estimated_total_epochs = max_steps * accumulation_steps / conditions_per_epoch
     base_seed = int(config.get("seed", 42))
     group_counter = (
         trainer.optimizer_step * int(optimizer_config["gradient_accumulation_steps"])
         + trainer.accumulation_step
     )
+    progress = tqdm(
+        total=max_steps,
+        initial=trainer.optimizer_step,
+        desc="AWM-CoCA 训练",
+        unit="step",
+        dynamic_ncols=True,
+        disable=rank != 0,
+    )
+    if rank == 0:
+        progress.write(
+            f"[INFO] 训练长度：{max_steps} 次 optimizer update；"
+            f"每轮 {conditions_per_epoch} 个 condition；约 {estimated_total_epochs:.2f} 个 epoch"
+        )
     with (
+        progress,
         WandbMonitor(config, output, enabled=rank == 0) as monitor,
         AsyncRewardRunner(
             _reward_function(config), workers=int(config["reward"].get("workers", 1))
@@ -503,6 +522,19 @@ def train(config: dict[str, Any], *, resume: str | None = None, device: str = "c
     ):
         while trainer.optimizer_step < max_steps:
             for raw in _loader(config, manifest, sampler):
+                group_started_at = time.monotonic()
+                # DataLoader worker 预取会提前推进 sampler.position，不能用它显示消费进度。
+                # group_counter 只在一个 group 真正完成后递增，因此对进度与断点恢复都准确。
+                completed_condition = group_counter + 1
+                condition_position = (completed_condition - 1) % conditions_per_epoch + 1
+                epoch_index = (completed_condition - 1) // conditions_per_epoch + 1
+                current_epoch_progress = completed_condition / conditions_per_epoch
+                if rank == 0:
+                    progress.set_postfix(
+                        epoch=f"{current_epoch_progress:.2f}/{estimated_total_epochs:.2f}",
+                        condition=f"{condition_position}/{conditions_per_epoch}",
+                        stage="rollout",
+                    )
                 version = trainer.policy_version
                 runtime.set_policy_version(version)
                 prepared = runtime.prepare_condition(raw)
@@ -514,6 +546,12 @@ def train(config: dict[str, Any], *, resume: str | None = None, device: str = "c
                     prepared, seeds=local_seeds, output_dir=output,
                     expected_group_size=local_group_size,
                 )
+                if rank == 0:
+                    progress.set_postfix(
+                        epoch=f"{current_epoch_progress:.2f}/{estimated_total_epochs:.2f}",
+                        condition=f"{condition_position}/{conditions_per_epoch}",
+                        stage="reward",
+                    )
                 _score_group(config, rewards, group_dir, raw, version)
                 local_rows = _compact_rollout_rows(group_dir)
                 for row in local_rows:
@@ -536,13 +574,48 @@ def train(config: dict[str, Any], *, resume: str | None = None, device: str = "c
                     expected_policy_version=version,
                     global_rewards=global_rewards,
                 )
+                if rank == 0:
+                    progress.set_postfix(
+                        epoch=f"{current_epoch_progress:.2f}/{estimated_total_epochs:.2f}",
+                        condition=f"{condition_position}/{conditions_per_epoch}",
+                        stage="update",
+                    )
                 local_metrics = trainer.update_group(samples, group_id=global_group_id)
                 metrics = _global_group_metrics(_gather_per_rank(local_metrics))
-                train_row = {"condition_id": raw.condition_id, "group_id": global_group_id, **metrics}
+                reward_values = [
+                    float(row["reward"]["total_reward"])
+                    for row in global_rollout_rows
+                    if row.get("reward", {}).get("total_reward") is not None
+                ]
+                mean_reward = (
+                    float(sum(reward_values) / len(reward_values)) if reward_values else None
+                )
+                epoch_progress = completed_condition / conditions_per_epoch
+                train_row = {
+                    "condition_id": raw.condition_id,
+                    "group_id": global_group_id,
+                    "epoch": epoch_progress,
+                    "epoch_index": epoch_index,
+                    "condition_position": condition_position,
+                    "conditions_per_epoch": conditions_per_epoch,
+                    "estimated_total_epochs": estimated_total_epochs,
+                    "group_duration_seconds": time.monotonic() - group_started_at,
+                    "mean_reward": mean_reward,
+                    **metrics,
+                }
                 if logger is not None:
                     logger.write(train_row)
                     monitor.log_group(
                         train_row, global_rollout_rows, group_step=group_counter + 1
+                    )
+                    if metrics["optimizer_stepped"]:
+                        progress.update(1)
+                    progress.set_postfix(
+                        epoch=f"{epoch_progress:.2f}/{estimated_total_epochs:.2f}",
+                        condition=f"{condition_position}/{conditions_per_epoch}",
+                        loss=f"{float(metrics['loss']):.4g}",
+                        reward="n/a" if mean_reward is None else f"{mean_reward:.4f}",
+                        step_s=f"{train_row['group_duration_seconds']:.1f}",
                     )
                 group_counter += 1
                 if metrics["optimizer_stepped"]:

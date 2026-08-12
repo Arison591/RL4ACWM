@@ -1,5 +1,7 @@
 output_dir: outputs/awm_coca
 seed: 42
+# 训练按 optimizer update 停止，不按整数 epoch 停止。当前 203 个 condition 且
+# gradient_accumulation_steps=1，因此 1000 updates 约等于 4.93 epochs。
 max_optimizer_steps: 1000
 
 dataset:

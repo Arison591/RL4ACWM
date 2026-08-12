@@ -112,7 +112,14 @@ class WandbMonitor:
             "trainer/learning_rate": float(train_row["learning_rate"]),
             "trainer/world_size": int(train_row.get("world_size", 1)),
             "trainer/optimizer_stepped": int(bool(train_row.get("optimizer_stepped"))),
+            "trainer/epoch": float(train_row.get("epoch", 0.0)),
+            "trainer/epoch_index": int(train_row.get("epoch_index", 1)),
+            "trainer/condition_position": int(train_row.get("condition_position", 0)),
+            "trainer/conditions_per_epoch": int(train_row.get("conditions_per_epoch", 0)),
+            "trainer/group_duration_seconds": float(train_row.get("group_duration_seconds", 0.0)),
         }
+        if train_row.get("mean_reward") is not None:
+            payload["trainer/mean_reward"] = float(train_row["mean_reward"])
         if train_row.get("grad_norm") is not None:
             payload["trainer/grad_norm"] = float(train_row["grad_norm"])
         for key in (
