@@ -187,6 +187,7 @@ export PYTHONUNBUFFERED=1
 export TOKENIZERS_PARALLELISM=false
 export OMP_NUM_THREADS="${OMP_NUM_THREADS:-4}"
 export NCCL_ASYNC_ERROR_HANDLING=1
+export DIST_TIMEOUT_SECONDS="${DIST_TIMEOUT_SECONDS:-7200}"
 
 {
   echo "timestamp=${RUN_STAMP}"
@@ -200,6 +201,7 @@ export NCCL_ASYNC_ERROR_HANDLING=1
   echo "output_dir=${OUTPUT_DIR}"
   echo "cuda_visible_devices=${CUDA_VISIBLE_DEVICES}"
   echo "nproc_per_node=${NPROC_PER_NODE}"
+  echo "dist_timeout_seconds=${DIST_TIMEOUT_SECONDS}"
   echo "rollout_retention=${ROLLOUT_RETENTION}"
   echo "resume_checkpoint=${RESUME_CHECKPOINT}"
   echo "wandb_mode=${WANDB_MODE}"

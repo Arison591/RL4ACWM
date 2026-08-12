@@ -304,6 +304,8 @@ sampler 和随机数状态。`fresh_on_policy=true` 被强制执行：每个 gro
 - `geometry_psnr_center_db/temperature_db`：必须根据真实 PSNR 分布校准，决定 geometry
   reward 是否饱和。
 - `reward.workers`：建议保持每卡 1。SAM3 和 CoWTracker 是 GPU singleton，不适合线程并发。
+- `DIST_TIMEOUT_SECONDS`：不同 rank 的 rollout/reward 耗时可能相差较大；远端脚本默认
+  7200 秒，避免先完成的 rank 在汇总点被 PyTorch 默认 10 分钟 NCCL 超时误杀。
 - `dataset.num_workers`：每个 rank 的 worker 数；四卡默认合计 16 个。
 - `max_optimizer_steps`、checkpoint 间隔和 rollout 保留策略只控制运行长度、恢复粒度和磁盘。
 

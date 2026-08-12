@@ -8,7 +8,7 @@ import random
 import shutil
 import sys
 import time
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any
 
@@ -385,6 +385,19 @@ def _distributed_info() -> tuple[int, int]:
     return 0, 1
 
 
+def _distributed_timeout() -> timedelta:
+    """Allow slow, rank-skewed rollout/reward stages before collectives.
+
+    A rank that finishes reward evaluation early waits in the next gather while
+    slower ranks are still running SAM3/CoWTracker.  PyTorch's 10-minute NCCL
+    timeout is shorter than a valid reward stage on the target machine.
+    """
+    seconds = int(os.environ.get("DIST_TIMEOUT_SECONDS", "7200"))
+    if seconds <= 0:
+        raise ValueError("DIST_TIMEOUT_SECONDS must be positive")
+    return timedelta(seconds=seconds)
+
+
 def _gather_per_rank(value: Any) -> list[Any]:
     _, world_size = _distributed_info()
     if world_size == 1:
@@ -738,7 +751,11 @@ def main() -> None:
             parser.error("multi-process training requires CUDA and one visible GPU per rank")
         local_rank = int(os.environ.get("LOCAL_RANK", "0"))
         torch.cuda.set_device(local_rank)
-        dist.init_process_group(backend="nccl", init_method="env://")
+        dist.init_process_group(
+            backend="nccl",
+            init_method="env://",
+            timeout=_distributed_timeout(),
+        )
         initialized_here = True
         train_device = f"cuda:{local_rank}"
     try:
