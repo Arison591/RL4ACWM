@@ -63,7 +63,7 @@ conda env create -f environment.yml
 conda activate genie-psnr
 ```
 
-不要再额外执行仓库旧的 `pip install -r requirements.txt`，否则可能覆盖已经锁定的版本。
+依赖统一由 `environment.yml` 提供（仓库已移除 `requirements.txt`），请勿再单独执行 `pip install -r requirements.txt` 或 `pip install` 其他依赖文件，以免覆盖已锁定的版本。
 
 ## 2. W&B 实时训练日志
 
