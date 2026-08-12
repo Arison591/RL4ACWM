@@ -4,17 +4,19 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
 
-# 正常情况下只需要确认这三个目录。均可在命令前用同名环境变量覆盖。
-DATA_DIR="${DATA_DIR:-${REPO_ROOT}/dataset}"
+# 正常情况下只需要确认模型和输出目录。数据会自动发现，也可用 DATA_DIR 覆盖。
+# 目标训练机的数据盘与 workspace 分离，因此优先检查 hr_data；其他机器仍回退到仓库 dataset/。
+DATA_DIR="${DATA_DIR:-}"
+REMOTE_DATA_DIR="${REMOTE_DATA_DIR:-/hpc2hdd/home/bohantan/jhupload/hr_data}"
 MODEL_DIR="${MODEL_DIR:-${REPO_ROOT}/checkpoints}"
-OUTPUT_DIR="${OUTPUT_DIR:-${REPO_ROOT}/outputs/awm_coca_remote}"
+OUTPUT_DIR="${OUTPUT_DIR:-}"
 
 PYTHON_BIN="${PYTHON_BIN:-python}"
 NPROC_PER_NODE="${NPROC_PER_NODE:-4}"
 ROLLOUT_RETENTION="${ROLLOUT_RETENTION:-videos}"
 RESUME_CHECKPOINT="${RESUME_CHECKPOINT:-}"
 export WANDB_MODE="${WANDB_MODE:-online}"
-export WANDB_PROJECT="${WANDB_PROJECT:-genie-psnr}"
+export WANDB_PROJECT="${WANDB_PROJECT:-awm-coca}"
 export WANDB_VIDEO_EVERY="${WANDB_VIDEO_EVERY:-50}"
 export WANDB_VIDEO_SAMPLES="${WANDB_VIDEO_SAMPLES:-1}"
 export WANDB_INIT_TIMEOUT="${WANDB_INIT_TIMEOUT:-15}"
@@ -53,17 +55,18 @@ resolve_from_repo() {
   fi
 }
 
-DATA_DIR="$(resolve_from_repo "${DATA_DIR}")"
 MODEL_DIR="$(resolve_from_repo "${MODEL_DIR}")"
-OUTPUT_DIR="$(resolve_from_repo "${OUTPUT_DIR}")"
 
-find_prep_root() {
+find_prep_root_in() {
+  local data_root="$1"
   local candidate
-  if [[ -n "${PREP_DIR:-}" ]]; then
-    candidates=("$(resolve_from_repo "${PREP_DIR}")")
-  else
-    candidates=("${DATA_DIR}/prep" "${DATA_DIR}/output/prep" "${DATA_DIR}")
-  fi
+  local candidates=(
+    "${data_root}/prep"
+    "${data_root}/dataset/prep"
+    "${data_root}/output/prep"
+    "${data_root}/dataset/output/prep"
+    "${data_root}"
+  )
   for candidate in "${candidates[@]}"; do
     [[ -d "${candidate}" ]] || continue
     if [[ -n "$(find "${candidate}" -mindepth 2 -maxdepth 2 -name actions.npy -type f -print -quit)" ]]; then
@@ -74,18 +77,18 @@ find_prep_root() {
   return 1
 }
 
-find_gt_root() {
+find_gt_root_in() {
+  local data_root="$1"
   local candidate
-  if [[ -n "${GT_DIR:-}" ]]; then
-    candidates=("$(resolve_from_repo "${GT_DIR}")")
-  else
-    candidates=(
-      "${DATA_DIR}/selected_samples/samples"
-      "${DATA_DIR}/gt"
-      "${DATA_DIR}/data/agibotworld_beta/selected_samples/samples"
-      "${DATA_DIR}"
-    )
-  fi
+  local candidates=(
+    "${data_root}/selected_samples/samples"
+    "${data_root}/dataset/selected_samples/samples"
+    "${data_root}/gt"
+    "${data_root}/dataset/gt"
+    "${data_root}/data/agibotworld_beta/selected_samples/samples"
+    "${data_root}/dataset/data/agibotworld_beta/selected_samples/samples"
+    "${data_root}"
+  )
   for candidate in "${candidates[@]}"; do
     [[ -d "${candidate}" ]] || continue
     if [[ -n "$(find "${candidate}" -mindepth 2 -maxdepth 2 -name head_29_frames.mp4 -type f -print -quit)" ]]; then
@@ -96,16 +99,64 @@ find_gt_root() {
   return 1
 }
 
-PREP_ROOT="$(find_prep_root)" || {
-  echo "[ERROR] 无法在 DATA_DIR=${DATA_DIR} 下找到 <condition_id>/actions.npy" >&2
-  echo "[ERROR] 推荐结构: dataset/prep/<condition_id>/actions.npy" >&2
+if [[ -n "${PREP_DIR:-}" || -n "${GT_DIR:-}" ]]; then
+  DATA_DIR="${DATA_DIR:-${REMOTE_DATA_DIR}}"
+  DATA_DIR="$(resolve_from_repo "${DATA_DIR}")"
+  if [[ -n "${PREP_DIR:-}" ]]; then
+    PREP_ROOT="$(resolve_from_repo "${PREP_DIR}")"
+  else
+    PREP_ROOT="$(find_prep_root_in "${DATA_DIR}")" || true
+  fi
+  if [[ -n "${GT_DIR:-}" ]]; then
+    GT_ROOT="$(resolve_from_repo "${GT_DIR}")"
+  else
+    GT_ROOT="$(find_gt_root_in "${DATA_DIR}")" || true
+  fi
+else
+  if [[ -n "${DATA_DIR}" ]]; then
+    DATA_CANDIDATES=("$(resolve_from_repo "${DATA_DIR}")")
+  else
+    DATA_CANDIDATES=("${REMOTE_DATA_DIR}" "${REPO_ROOT}/dataset")
+  fi
+
+  DATA_DIR=""
+  PREP_ROOT=""
+  GT_ROOT=""
+  for candidate in "${DATA_CANDIDATES[@]}"; do
+    candidate="$(resolve_from_repo "${candidate}")"
+    if prep_candidate="$(find_prep_root_in "${candidate}")" \
+      && gt_candidate="$(find_gt_root_in "${candidate}")"; then
+      DATA_DIR="${candidate}"
+      PREP_ROOT="${prep_candidate}"
+      GT_ROOT="${gt_candidate}"
+      break
+    fi
+  done
+fi
+
+# 外部数据盘存在时，checkpoint、rollout 和日志也默认写到数据盘，避免占满 workspace。
+if [[ -z "${OUTPUT_DIR}" ]]; then
+  if [[ -n "${DATA_DIR}" && "${DATA_DIR}" != "${REPO_ROOT}"/* ]]; then
+    OUTPUT_DIR="${DATA_DIR}/awm_coca_outputs"
+  else
+    OUTPUT_DIR="${REPO_ROOT}/outputs/awm_coca_remote"
+  fi
+else
+  OUTPUT_DIR="$(resolve_from_repo "${OUTPUT_DIR}")"
+fi
+
+if [[ ! -d "${PREP_ROOT}" ]] || [[ -z "$(find "${PREP_ROOT}" -mindepth 2 -maxdepth 2 -name actions.npy -type f -print -quit)" ]]; then
+  echo "[ERROR] 找不到训练 condition：<condition_id>/actions.npy" >&2
+  echo "[ERROR] 已检查 DATA_DIR=${DATA_DIR:-<自动发现失败>}" >&2
+  echo "[ERROR] 可执行 DATA_DIR=/实际数据目录 bash scripts/train_remote.sh 显式指定。" >&2
   exit 2
-}
-GT_ROOT="$(find_gt_root)" || {
-  echo "[ERROR] 无法在 DATA_DIR=${DATA_DIR} 下找到 <condition_id>/head_29_frames.mp4" >&2
-  echo "[ERROR] 推荐结构: dataset/selected_samples/samples/<condition_id>/*_29_frames.mp4" >&2
+fi
+if [[ ! -d "${GT_ROOT}" ]] || [[ -z "$(find "${GT_ROOT}" -mindepth 2 -maxdepth 2 -name head_29_frames.mp4 -type f -print -quit)" ]]; then
+  echo "[ERROR] 找不到奖励 GT：<condition_id>/head_29_frames.mp4" >&2
+  echo "[ERROR] 已检查 DATA_DIR=${DATA_DIR:-<自动发现失败>}" >&2
+  echo "[ERROR] 可执行 GT_DIR=/实际GT目录 bash scripts/train_remote.sh 显式指定。" >&2
   exit 2
-}
+fi
 
 mkdir -p "${OUTPUT_DIR}/logs"
 RUN_STAMP="$(date +%Y%m%d_%H%M%S)"

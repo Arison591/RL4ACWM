@@ -54,7 +54,7 @@ class WandbMonitor:
 
             self.wandb = wandb
             init_kwargs: dict[str, Any] = {
-                "project": os.environ.get("WANDB_PROJECT", "genie-psnr"),
+                "project": os.environ.get("WANDB_PROJECT", "awm-coca"),
                 "name": os.environ.get("WANDB_NAME") or None,
                 "dir": str(self.output_dir / "logs"),
                 "config": config,

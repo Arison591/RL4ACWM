@@ -24,14 +24,14 @@ bash scripts/train_remote.sh
 
 默认约定：
 
-- 数据目录：仓库根目录下的 `dataset/`；
+- 数据目录：目标训练机默认自动识别 `/hpc2hdd/home/bohantan/jhupload/hr_data`，其他机器回退到仓库根目录的 `dataset/`；
 - 模型目录：仓库根目录下的 `checkpoints/`；
-- 输出目录：`outputs/awm_coca_remote/`；
+- 输出目录：目标训练机默认为数据盘下的 `/hpc2hdd/home/bohantan/jhupload/hr_data/awm_coca_outputs/`；其他机器没有外部数据盘时回退到 `outputs/awm_coca_remote/`；
 - GPU：`CUDA_VISIBLE_DEVICES=0,1,2,3`；
 - 全局 `group_size=16`，每张 GPU 负责 4 条 rollout；
 - reward：50% Action + 50% 三视角 PSNR geometry；
 - 默认保留三视角 MP4、reward、credit 和元数据，训练消费后删除大体积中间张量。
-- 默认尝试把训练曲线上传到 W&B 项目 `genie-psnr`，失败时自动继续使用本地日志。
+- 默认尝试把训练曲线上传到 W&B 项目 `awm-coca`，失败时自动继续使用本地日志。
 
 ## 1. 机器要求
 
@@ -75,13 +75,13 @@ W&B 默认启用。训练执行者先设置自己的 API key：
 ```bash
 export WANDB_API_KEY=<对方自己的 W&B API key>
 export WANDB_ENTITY=<双方都能访问的 team 或用户名>
-export WANDB_PROJECT=genie-psnr
+export WANDB_PROJECT=awm-coca
 ```
 
 训练启动后，控制台会打印 run URL，并写入：
 
 ```text
-outputs/awm_coca_remote/logs/wandb_run.txt
+/hpc2hdd/home/bohantan/jhupload/hr_data/awm_coca_outputs/logs/wandb_run.txt
 ```
 
 把其中的 `url=` 发回来，即可在网页实时查看：loss、learning rate、gradient norm、
@@ -106,7 +106,17 @@ W&B，训练完成后仍按第 9 节打包回传。
 
 ## 3. 数据目录
 
-对方拿到的数据集名称为 `dataset`。推荐目录结构：
+目标训练机的数据根目录为：
+
+```text
+/hpc2hdd/home/bohantan/jhupload/hr_data
+```
+
+代码位于空间较小的 `workspace`，数据保留在 `jhupload/hr_data`，不需要复制或软链接到
+代码仓库。直接执行 `bash scripts/train_remote.sh` 时，脚本会优先自动识别该目录，并将
+checkpoint、rollout、日志等训练输出写入 `hr_data/awm_coca_outputs/`，避免占满 workspace。
+
+数据集内部推荐结构：
 
 ```text
 dataset/
@@ -135,8 +145,16 @@ dataset/
 - `dataset/output/prep/`；
 - `dataset/data/agibotworld_beta/selected_samples/samples/`；
 - condition 同时直接放在 `dataset/<condition_id>/`。
+- 数据根目录外面或里面额外套一层 `dataset/`，例如
+  `/hpc2hdd/home/bohantan/jhupload/hr_data/dataset/prep/`。
 
-如果实际路径不同，不用改代码：
+目标训练机直接运行即可，不用设置 `DATA_DIR`：
+
+```bash
+bash scripts/train_remote.sh
+```
+
+如果迁移到其他机器且实际路径不同，也不用改代码：
 
 ```bash
 DATA_DIR=/data/dataset bash scripts/train_remote.sh
@@ -254,10 +272,10 @@ ROLLOUT_RETENTION=none bash scripts/train_remote.sh
 
 ## 7. 输出、日志和 checkpoint
 
-默认输出：
+目标训练机默认输出（其他机器以启动时打印的 `output_dir` 为准）：
 
 ```text
-outputs/awm_coca_remote/
+/hpc2hdd/home/bohantan/jhupload/hr_data/awm_coca_outputs/
   logs/
     train_<timestamp>.log              # 完整 stdout/stderr
     run_<timestamp>.txt                # Git、GPU、数据和路径信息
@@ -276,7 +294,7 @@ outputs/awm_coca_remote/
 实时查看：
 
 ```bash
-tail -f outputs/awm_coca_remote/logs/train_*.log
+tail -f /hpc2hdd/home/bohantan/jhupload/hr_data/awm_coca_outputs/logs/train_*.log
 nvidia-smi
 watch -n 30 df -h
 ```
@@ -307,7 +325,7 @@ bash scripts/train_remote.sh
 不需要回传 TB 级 rollout。执行：
 
 ```bash
-bash scripts/package_training_results.sh outputs/awm_coca_remote
+bash scripts/package_training_results.sh /hpc2hdd/home/bohantan/jhupload/hr_data/awm_coca_outputs
 ```
 
 脚本选择最新带 `COMPLETE` 标记的 checkpoint，并将以下内容打包：
@@ -320,8 +338,8 @@ bash scripts/package_training_results.sh outputs/awm_coca_remote
 生成：
 
 ```text
-outputs/awm_coca_remote/transfer/awm_coca_checkpoint_<step>_<timestamp>.tar.gz
-outputs/awm_coca_remote/transfer/awm_coca_checkpoint_<step>_<timestamp>.tar.gz.sha256
+/hpc2hdd/home/bohantan/jhupload/hr_data/awm_coca_outputs/transfer/awm_coca_checkpoint_<step>_<timestamp>.tar.gz
+/hpc2hdd/home/bohantan/jhupload/hr_data/awm_coca_outputs/transfer/awm_coca_checkpoint_<step>_<timestamp>.tar.gz.sha256
 ```
 
 请将这两个文件一起传回。收到后先运行：
