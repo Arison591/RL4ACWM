@@ -29,6 +29,8 @@ EXPECTED_VERSIONS = {
     "numpy": "2.2.6",
     "opencv-python": "4.10.0.84",
     "huggingface-hub": "0.36.2",
+    "modelscope": "1.39.1",
+    "modelscope-hub": "0.2.0",
     "wandb": "0.28.1",
 }
 
@@ -50,7 +52,13 @@ IMPORT_MODULES = (
     "yaml",
     "PIL",
     "wandb",
+    "modelscope",
 )
+
+
+def versions_match(actual: str, expected: str) -> bool:
+    """接受 PyTorch wheel 的 +cu126 等 PEP 440 local version 后缀。"""
+    return actual.split("+", maxsplit=1)[0] == expected
 
 
 def main() -> None:
@@ -69,7 +77,7 @@ def main() -> None:
             errors.append(f"缺少 Python 包: {distribution}=={expected}")
             continue
         versions[distribution] = actual
-        if actual != expected:
+        if not versions_match(actual, expected):
             errors.append(f"版本不一致: {distribution}={actual}, 期望 {expected}")
 
     for module in IMPORT_MODULES:
@@ -98,8 +106,8 @@ def main() -> None:
 
     if shutil.which("ffmpeg") is None:
         errors.append("找不到 ffmpeg")
-    if shutil.which("hf") is None:
-        errors.append("找不到 hf CLI")
+    if shutil.which("modelscope") is None:
+        errors.append("找不到 modelscope CLI")
 
     source_paths = (
         REPO_ROOT / "third_party" / "sam3" / "sam3" / "model_builder.py",

@@ -40,7 +40,7 @@ bash scripts/train_remote.sh
 - NVIDIA 驱动能够运行 CUDA 12.6 PyTorch wheel；
 - 建议至少预留 30GB 模型下载空间；
 - 若保留全部 rollout，训练输出可能达到 TB 级，请预留足够数据盘；
-- Conda、Git、Git LFS 和可访问 Hugging Face、ModelScope、GitHub 的网络。
+- Conda、Git、Git LFS 和可访问 ModelScope、GitHub 的网络。
 
 环境基于当前真实跑通版本整理，没有直接导出开发机上的整个 Conda 环境。关键版本为：
 
@@ -180,16 +180,18 @@ bash scripts/download_models.sh
 
 | 资产 | 固定仓库/revision |
 | --- | --- |
-| Cosmos text encoder、tokenizer、VAE、scheduler | `nvidia/Cosmos-Predict2-2B-Video2World@f50c09f5d8ab133a90cac3f4886a6471e9ba3f18` |
-| GE-Sim Cosmos | `agibot_world/Genie-Envisioner@1422f1783e5eed8e00925d3ce9ba3a0ba59e84df` |
-| SAM3 权重 | `facebook/sam3@3c879f39826c281e95690f02c7821c4de09afae7` |
-| YOLO-World EEF 权重 | `agibot-world/EWMBench-model@85a49f8118ec656c9d511c5236582ac7fde16fbc` |
-| CoWTracker 权重 | `facebook/cowtracker@f4633e5671c5f19ea8500943869f4c975b605fde` |
+| Cosmos text encoder、tokenizer、VAE、scheduler | ModelScope `nv-community/Cosmos-Predict2-2B-Video2World@efdf2314d7edb0f9bee14e9753462f8e2e0ff075` |
+| GE-Sim Cosmos | ModelScope `agibot_world/Genie-Envisioner@1422f1783e5eed8e00925d3ce9ba3a0ba59e84df` |
+| SAM3 权重 | ModelScope `facebook/sam3@96f3e1b404ba14f2cfac60ee6ae87c269a7b7923` |
+| YOLO-World EEF 权重 | ModelScope `agibot-world/EWMBench-model@6ec404f1f68d362a9b625f570040c200370077f6` |
+| CoWTracker 权重 | ModelScope `facebook/cowtracker@f4633e5671c5f19ea8500943869f4c975b605fde` |
 | SAM3 源码 | GitHub commit `6dbb02bd38288df755dfa1378000a861e65b84f6` |
 | CoWTracker 源码 | GitHub commit `1454f20045d3b514e5b8417907152677f3dba621` |
 
 大文件会执行 SHA256 校验，重复运行会跳过已正确下载的文件。脚本还会自动应用当前
 PyTorch/timm/xformers 所需的 SAM3 和 CoWTracker 兼容补丁。
+所有模型权重均从 ModelScope 的固定 revision 匿名下载，不需要 Hugging Face 登录或 token；
+SAM3 和 CoWTracker 的第三方源码仍从 GitHub 固定 commit 拉取。
 
 如果模型希望放在数据盘：
 
@@ -201,12 +203,6 @@ MODEL_DIR=/data/models/genie bash scripts/download_models.sh
 
 ```bash
 MODEL_DIR=/data/models/genie bash scripts/train_remote.sh
-```
-
-SAM3 若提示访问权限问题，需要先在 Hugging Face 页面接受对应许可证，然后设置：
-
-```bash
-export HF_TOKEN=<只读 token>
 ```
 
 CoWTracker 权重采用 CC-BY-NC-4.0，运行下载脚本前请确认训练用途符合其许可证。

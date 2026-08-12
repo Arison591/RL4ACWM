@@ -9,12 +9,14 @@ if [[ "${MODEL_DIR}" != /* ]]; then
   MODEL_DIR="${REPO_ROOT}/${MODEL_DIR}"
 fi
 
-COSMOS_REPO="nvidia/Cosmos-Predict2-2B-Video2World"
-COSMOS_REV="f50c09f5d8ab133a90cac3f4886a6471e9ba3f18"
+COSMOS_REPO="nv-community/Cosmos-Predict2-2B-Video2World"
+COSMOS_REV="efdf2314d7edb0f9bee14e9753462f8e2e0ff075"
 SAM3_MODEL_REPO="facebook/sam3"
-SAM3_MODEL_REV="3c879f39826c281e95690f02c7821c4de09afae7"
+SAM3_MODEL_REV="96f3e1b404ba14f2cfac60ee6ae87c269a7b7923"
 YOLO_REPO="agibot-world/EWMBench-model"
-YOLO_REV="85a49f8118ec656c9d511c5236582ac7fde16fbc"
+YOLO_REV="6ec404f1f68d362a9b625f570040c200370077f6"
+MODELSCOPE_BASE_URL="https://modelscope.cn/models"
+MODEL_DOWNLOAD_WORKERS="${MODEL_DOWNLOAD_WORKERS:-8}"
 
 GESIM_REPO_REV="1422f1783e5eed8e00925d3ce9ba3a0ba59e84df"
 GESIM_SHA256="0e49bbe4e83c2b6e380e0e2215f8f257ac760498b772b20e52f37a40b6649f8d"
@@ -33,9 +35,9 @@ for command_name in git curl sha256sum; do
   }
 done
 
-HF_BIN="${HF_BIN:-$(command -v hf || true)}"
-if [[ -z "${HF_BIN}" ]]; then
-  echo "[ERROR] 找不到 hf CLI；请先 conda activate genie-psnr" >&2
+MODELSCOPE_BIN="${MODELSCOPE_BIN:-$(command -v modelscope || true)}"
+if [[ -z "${MODELSCOPE_BIN}" ]]; then
+  echo "[ERROR] 找不到 modelscope CLI；请先使用 environment.yml 创建并激活环境" >&2
   exit 2
 fi
 
@@ -130,39 +132,34 @@ apply_patch_once \
 echo "[LICENSE] CoWTracker 模型为 CC-BY-NC-4.0，仅限符合其许可证的用途。"
 
 echo "[DOWNLOAD] ${COSMOS_REPO} @ ${COSMOS_REV}"
-"${HF_BIN}" download "${COSMOS_REPO}" \
+"${MODELSCOPE_BIN}" download "${COSMOS_REPO}" \
+  --repo-type model \
   --revision "${COSMOS_REV}" \
-  --include "model_index.json" "scheduler/*" "text_encoder/*" "tokenizer/*" "vae/*" \
-  --local-dir "${MODEL_DIR}/Cosmos-Predict2-2B-Video2World"
+  --local-dir "${MODEL_DIR}/Cosmos-Predict2-2B-Video2World" \
+  --max-workers "${MODEL_DOWNLOAD_WORKERS}" \
+  --include "model_index.json" "scheduler/*" "text_encoder/*" "tokenizer/*" "vae/*"
 
-echo "[DOWNLOAD] ${SAM3_MODEL_REPO}/sam3.pt @ ${SAM3_MODEL_REV}"
-if ! "${HF_BIN}" download "${SAM3_MODEL_REPO}" sam3.pt \
-  --revision "${SAM3_MODEL_REV}" --local-dir "${MODEL_DIR}"; then
-  echo "[ERROR] SAM3 是 gated 模型：请先在 Hugging Face 接受使用条款，并设置 HF_TOKEN 或执行 hf auth login。" >&2
-  exit 2
-fi
-verify_sha256 "${MODEL_DIR}/sam3.pt" "${SAM3_SHA256}" || {
-  echo "[ERROR] SAM3 权重 SHA256 校验失败" >&2
-  exit 2
-}
+download_checked \
+  "SAM3" \
+  "${MODELSCOPE_BASE_URL}/${SAM3_MODEL_REPO}/resolve/${SAM3_MODEL_REV}/sam3.pt" \
+  "${MODEL_DIR}/sam3.pt" \
+  "${SAM3_SHA256}"
 
-echo "[DOWNLOAD] ${YOLO_REPO}/yoloworld-EWMBench-v0.1.pt @ ${YOLO_REV}"
-"${HF_BIN}" download "${YOLO_REPO}" yoloworld-EWMBench-v0.1.pt \
-  --revision "${YOLO_REV}" --local-dir "${MODEL_DIR}"
-verify_sha256 "${MODEL_DIR}/yoloworld-EWMBench-v0.1.pt" "${YOLO_SHA256}" || {
-  echo "[ERROR] YOLO-World 权重 SHA256 校验失败" >&2
-  exit 2
-}
+download_checked \
+  "YOLO-World EEF" \
+  "${MODELSCOPE_BASE_URL}/${YOLO_REPO}/resolve/${YOLO_REV}/yoloworld-EWMBench-v0.1.pt" \
+  "${MODEL_DIR}/yoloworld-EWMBench-v0.1.pt" \
+  "${YOLO_SHA256}"
 
 download_checked \
   "GE-Sim Cosmos" \
-  "https://www.modelscope.cn/models/agibot_world/Genie-Envisioner/resolve/${GESIM_REPO_REV}/ge_sim_cosmos_v0.1.safetensors" \
+  "${MODELSCOPE_BASE_URL}/agibot_world/Genie-Envisioner/resolve/${GESIM_REPO_REV}/ge_sim_cosmos_v0.1.safetensors" \
   "${MODEL_DIR}/gesim/ge_sim_cosmos_v0.1.safetensors" \
   "${GESIM_SHA256}"
 
 download_checked \
   "CoWTracker" \
-  "https://www.modelscope.cn/models/facebook/cowtracker/resolve/${COW_MODEL_REV}/cowtracker_model.pth" \
+  "${MODELSCOPE_BASE_URL}/facebook/cowtracker/resolve/${COW_MODEL_REV}/cowtracker_model.pth" \
   "${MODEL_DIR}/cowtracker/cowtracker_model.pth" \
   "${COW_MODEL_SHA256}"
 
