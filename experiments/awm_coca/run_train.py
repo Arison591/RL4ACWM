@@ -26,7 +26,12 @@ from torch.utils.data import DataLoader
 from tqdm.auto import tqdm
 
 from experiments.awm_coca.async_reward import AsyncRewardRunner, RewardRequest
-from experiments.awm_coca.checkpointing import load_checkpoint, restore_rng_state, save_checkpoint
+from experiments.awm_coca.checkpointing import (
+    AsyncCheckpointWriter,
+    build_checkpoint_snapshot,
+    load_checkpoint,
+    restore_rng_state,
+)
 from experiments.awm_coca.coca_credit import compute_credit
 from experiments.awm_coca.condition_dataset import (
     PrepConditionDataset, build_manifest, collate_single_condition, write_manifest,
@@ -284,7 +289,11 @@ def _reward_function(config: dict[str, Any]):
     return evaluate
 
 
-def _score_group(config: dict[str, Any], runner: AsyncRewardRunner, group_dir: Path, raw: Any, version: int) -> None:
+def _score_group(
+    config: dict[str, Any], runner: AsyncRewardRunner, group_dir: Path, raw: Any, version: int,
+    *,
+    artifacts: dict[int, Any] | None = None,
+) -> None:
     futures = []
     for seed_dir in sorted(path for path in group_dir.iterdir() if path.is_dir() and path.name.startswith("seed_")):
         rollout = json.loads((seed_dir / "rollout.json").read_text(encoding="utf-8"))
@@ -301,10 +310,16 @@ def _score_group(config: dict[str, Any], runner: AsyncRewardRunner, group_dir: P
     for result in results:
         seed_dir = group_dir / result.sample_id
         (seed_dir / "reward.json").write_text(json.dumps(result.reward, ensure_ascii=False, indent=2), encoding="utf-8")
-        try:
-            trajectory = torch.load(seed_dir / "trajectory.pt", map_location="cpu", weights_only=False)
-        except TypeError:
-            trajectory = torch.load(seed_dir / "trajectory.pt", map_location="cpu")
+        if artifacts is not None:
+            artifact = artifacts.get(result.seed)
+            if artifact is None:
+                raise ValueError(f"missing in-memory rollout artifact for seed {result.seed}")
+            trajectory = {"chunks": [artifact.trajectory], "num_chunks": 1}
+        else:
+            try:
+                trajectory = torch.load(seed_dir / "trajectory.pt", map_location="cpu", weights_only=False)
+            except TypeError:
+                trajectory = torch.load(seed_dir / "trajectory.pt", map_location="cpu")
         credit = compute_credit(
             trajectory, float(result.reward["total_reward"]),
             window_size=int(config["proposal"].get("coca_window_size", 3)),
@@ -520,6 +535,7 @@ def train(config: dict[str, Any], *, resume: str | None = None, device: str = "c
             _reward_function(config), workers=int(config["reward"].get("workers", 1))
         ) as rewards,
     ):
+        checkpoint_writer = AsyncCheckpointWriter() if rank == 0 else None
         while trainer.optimizer_step < max_steps:
             for raw in _loader(config, manifest, sampler):
                 group_started_at = time.monotonic()
@@ -542,9 +558,10 @@ def train(config: dict[str, Any], *, resume: str | None = None, device: str = "c
                 global_group_id = f"{raw.condition_id}_policy_{version:08d}_seed_{first_seed}"
                 all_seeds = [first_seed + offset for offset in range(global_group_size)]
                 local_seeds = all_seeds[rank * local_group_size : (rank + 1) * local_group_size]
-                group_dir = runtime.rollout_group(
+                group_dir, artifacts = runtime.rollout_group(
                     prepared, seeds=local_seeds, output_dir=output,
                     expected_group_size=local_group_size,
+                    rollout_batch_size=int(config["rollout"].get("rollout_batch_size", 1)),
                 )
                 if rank == 0:
                     progress.set_postfix(
@@ -552,7 +569,8 @@ def train(config: dict[str, Any], *, resume: str | None = None, device: str = "c
                         condition=f"{condition_position}/{conditions_per_epoch}",
                         stage="reward",
                     )
-                _score_group(config, rewards, group_dir, raw, version)
+                artifacts_by_seed = {artifact.seed: artifact for artifact in artifacts}
+                _score_group(config, rewards, group_dir, raw, version, artifacts=artifacts_by_seed)
                 local_rows = _compact_rollout_rows(group_dir)
                 for row in local_rows:
                     row["global_group_id"] = global_group_id
@@ -573,6 +591,7 @@ def train(config: dict[str, Any], *, resume: str | None = None, device: str = "c
                     group_dir, device=runtime.device, expected_group_size=local_group_size,
                     expected_policy_version=version,
                     global_rewards=global_rewards,
+                    artifacts=artifacts_by_seed,
                 )
                 if rank == 0:
                     progress.set_postfix(
@@ -622,11 +641,20 @@ def train(config: dict[str, Any], *, resume: str | None = None, device: str = "c
                     runtime.set_policy_version(trainer.policy_version)
                     every = int(config["checkpoint"]["every_optimizer_steps"])
                     if rank == 0 and every > 0 and trainer.optimizer_step % every == 0:
-                        save_checkpoint(
-                            output / "checkpoints", step=trainer.optimizer_step, policy=runtime.transformer,
-                            optimizer=trainer.optimizer, lr_scheduler=trainer.lr_scheduler,
-                            ema_state={} if ema is None else ema.state_dict(), sampler_state=sampler.state_dict(),
-                            trainer_state=trainer.state_dict(), config=config,
+                        # 主线程只做 CPU 快照（快），序列化 + 落盘由后台线程完成，
+                        # 避免 rank0 在 checkpoint I/O 上阻塞整组。
+                        checkpoint_writer.submit(
+                            output / "checkpoints", step=trainer.optimizer_step,
+                            snapshot=build_checkpoint_snapshot(
+                                step=trainer.optimizer_step,
+                                policy=runtime.transformer,
+                                optimizer=trainer.optimizer,
+                                lr_scheduler=trainer.lr_scheduler,
+                                ema_state={} if ema is None else ema.state_dict(),
+                                sampler_state=sampler.state_dict(),
+                                trainer_state=trainer.state_dict(),
+                                config=config,
+                            ),
                         )
                 if world_size > 1:
                     dist.barrier()
@@ -636,9 +664,11 @@ def train(config: dict[str, Any], *, resume: str | None = None, device: str = "c
                     keep_legacy = bool(config.get("storage", {}).get("keep_consumed_rollouts", True))
                     retention = "all" if keep_legacy else "none"
                 _retain_consumed_group(group_dir, output, str(retention))
-                del samples, prepared
+                del samples, prepared, artifacts, artifacts_by_seed
                 if trainer.optimizer_step >= max_steps:
                     break
+        if checkpoint_writer is not None:
+            checkpoint_writer.close()
 
 
 def main() -> None:

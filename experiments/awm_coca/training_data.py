@@ -32,6 +32,7 @@ def load_fresh_rollout_group(
     expected_group_size: int | None = None,
     expected_policy_version: int | None = None,
     global_rewards: list[float] | None = None,
+    artifacts: dict[int, Any] | None = None,
 ) -> tuple[str, list[RolloutTrainingSample]]:
     root = Path(group_dir)
     metadata_path = root / "group.json"
@@ -64,16 +65,23 @@ def load_fresh_rollout_group(
         total_reward = reward.get("total_reward")
         if total_reward is None:
             raise ValueError(f"invalid reward in {directory}")
-        latent_path = directory / "final_future_latent.pt"
-        if not latent_path.is_file():
-            raise FileNotFoundError(f"missing explicit future latent: {latent_path}")
         rewards.append(float(total_reward))
-        condition_path = directory / "condition.pt"
-        if not condition_path.is_file():
-            condition_path = root / "condition.pt"
-        if not condition_path.is_file():
-            raise FileNotFoundError(f"missing seed or shared condition: {condition_path}")
-        payloads.append((directory, credit, _load_torch(latent_path), _condition(_load_torch(condition_path))))
+        seed = int(seed_meta["seed"])
+        if artifacts is not None:
+            artifact = artifacts.get(seed)
+            if artifact is None:
+                raise ValueError(f"missing in-memory rollout artifact for seed {seed} in {directory}")
+            payloads.append((directory, credit, artifact.final_future_latent, _condition(artifact.condition_template)))
+        else:
+            latent_path = directory / "final_future_latent.pt"
+            if not latent_path.is_file():
+                raise FileNotFoundError(f"missing explicit future latent: {latent_path}")
+            condition_path = directory / "condition.pt"
+            if not condition_path.is_file():
+                condition_path = root / "condition.pt"
+            if not condition_path.is_file():
+                raise FileNotFoundError(f"missing seed or shared condition: {condition_path}")
+            payloads.append((directory, credit, _load_torch(latent_path), _condition(_load_torch(condition_path))))
     advantage_rewards = rewards if global_rewards is None else [float(value) for value in global_rewards]
     if len(advantage_rewards) < 2:
         raise ValueError("global leave-one-out advantage requires at least two rewards")

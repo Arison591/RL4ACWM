@@ -35,6 +35,10 @@ rollout:
   group_size: 16
   reverse_denoise_steps: 15
   fresh_on_policy: true
+  # 每批 rollout 的 seed 数。1 = 逐 seed 推理（与旧版行为一致，seed 噪声流可复现）；
+  # 2 = 每卡两个 seed 合并为一次 pipeline 推理，摊薄调度/VAE/forward 开销。
+  # 必须整除每卡 local group_size（4 卡 + group_size=16 时为 4）。改大前先小步冒烟验证。
+  rollout_batch_size: 2
 
 proposal:
   num_training_noise_levels: 7
@@ -83,9 +87,9 @@ reward:
   confidence: 0.1
   # 训练保持三项等权；评估配置中的 0.2/0.1/0.7 是另一套实验假设，校准前不采用。
   action_metric_weights:
-    mean_iou: 0.3333333333333333
-    af_fdce_ate_norm: 0.3333333333333333
-    fdce: 0.3333333333333333
+    mean_iou: 0.1
+    af_fdce_ate_norm: 0.7
+    fdce: 0.2
   af_fdce_ate_norm_scale: 0.2
   fdce_scale: 10.0
   fdce_k: 16

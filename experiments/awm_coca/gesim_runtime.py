@@ -34,6 +34,19 @@ class PreparedGeSimCondition:
     condition_template: GeSimConditionBatch | None = None
 
 
+@dataclass
+class RolloutArtifact:
+    """In-memory per-seed rollout tensors, avoiding the trajectory.pt /
+    final_future_latent.pt / condition.pt disk round-trip in the training path.
+    Only mp4s and small JSON metadata are persisted to disk."""
+
+    seed: int
+    seed_dir: Path
+    trajectory: list[dict[str, Any]]
+    final_future_latent: torch.Tensor
+    condition_template: GeSimConditionBatch
+
+
 class PersistentGeSimRuntime:
     """GE-Sim process runtime whose transformer and LoRA survive optimizer steps."""
 
@@ -130,7 +143,8 @@ class PersistentGeSimRuntime:
         output_dir: str | Path,
         prompt: str = DEFAULT_PROMPT,
         expected_group_size: int | None = None,
-    ) -> Path:
+        rollout_batch_size: int = 1,
+    ) -> tuple[Path, list[RolloutArtifact]]:
         required_size = (
             int(self.config["rollout"]["group_size"])
             if expected_group_size is None
@@ -138,6 +152,8 @@ class PersistentGeSimRuntime:
         )
         if len(seeds) != required_size or len(set(seeds)) != len(seeds):
             raise ValueError("rollout seeds must be unique and match group_size")
+        if rollout_batch_size <= 0 or len(seeds) % rollout_batch_size:
+            raise ValueError(f"rollout_batch_size={rollout_batch_size} must divide group size {len(seeds)}")
         group_id = f"{prepared.condition_id}_policy_{self.policy_version:08d}_seed_{int(seeds[0])}"
         group_dir = Path(output_dir) / "rollouts" / group_id
         group_dir.mkdir(parents=True, exist_ok=False)
@@ -148,47 +164,104 @@ class PersistentGeSimRuntime:
         (group_dir / "group.json").write_text(json.dumps(metadata, indent=2), encoding="utf-8")
         self.transformer.eval()
         try:
-            for seed in seeds:
-                self._rollout_seed(prepared, seed=seed, seed_dir=group_dir / f"seed_{seed}", prompt=prompt)
+            artifacts: list[RolloutArtifact] = []
+            for start in range(0, len(seeds), rollout_batch_size):
+                chunk = seeds[start:start + rollout_batch_size]
+                artifacts.extend(
+                    self._rollout_batch(prepared, seeds=chunk, group_dir=group_dir, prompt=prompt)
+                )
         finally:
             self.transformer.train()
-        return group_dir
+        return group_dir, artifacts
 
     @torch.inference_mode()
-    def _rollout_seed(self, prepared: PreparedGeSimCondition, *, seed: int, seed_dir: Path, prompt: str) -> None:
-        seed_dir.mkdir(parents=True, exist_ok=False)
+    def _rollout_batch(
+        self, prepared: PreparedGeSimCondition, *, seeds: Sequence[int], group_dir: Path, prompt: str
+    ) -> list[RolloutArtifact]:
+        """Run one denoise batch for `batch` seeds in a single pipeline call.
+
+        Reverse trajectories and future latents are returned in memory (no
+        trajectory.pt / final_future_latent.pt / condition.pt round-trip to
+        disk); only mp4s and small JSON metadata are persisted.
+        """
         observation = prepared.observation
         views, _, _, height, width = observation.shape
-        trajectory: list[dict[str, Any]] = []
+        batch = len(seeds)
+        n_steps = int(self.config["rollout"]["reverse_denoise_steps"])
+        # (b v) c t h w batch input; each seed contributes `views` rows.
+        video = (
+            observation.unsqueeze(0)
+            .expand(batch, *observation.shape)
+            .reshape(batch * views, *observation.shape[1:])
+            .permute(0, 2, 1, 3, 4)
+        )
+        cond_to_concat = rearrange(prepared.cond_to_concat, "c v t h w -> v c t h w")
+        cond_to_concat = (
+            cond_to_concat.unsqueeze(0)
+            .expand(batch, *cond_to_concat.shape)
+            .reshape(batch * views, *cond_to_concat.shape[1:])
+        )
+        prompt_embeds = prepared.prompt_embeds
+        if prompt_embeds is not None:
+            prompt_embeds = prompt_embeds.to(self.device).repeat(batch, 1, 1)
+        memory = prepared.memory_latents
+        if memory is not None:
+            memory = memory.to(self.device)
+            memory = memory.unsqueeze(0).expand(batch, *memory.shape).reshape(batch * views, *memory.shape[1:])
+
+        # Deterministic per-(seed, view) noise stream for batch > 1; keep the
+        # legacy single-generator path for batch == 1 so previous rollouts stay
+        # bit-for-bit reproducible.
+        if batch == 1:
+            generators: Any = torch.Generator(device=self.device).manual_seed(int(seeds[0]))
+        else:
+            generators = [
+                torch.Generator(device=self.device).manual_seed(int(seed) * views + view)
+                for seed in seeds for view in range(views)
+            ]
+
+        trajectories: list[list[dict[str, Any]]] = [[] for _ in range(batch)]
         captured_condition: dict[str, torch.Tensor] = {}
 
         def on_start(_pipe: Any, index: int, timestep: torch.Tensor, values: dict[str, torch.Tensor]) -> None:
+            latents = values["latents"]
             if index == 0:
-                trajectory.append({"step": 0, "timestep": float(timestep.item()), "latents": values["latents"].detach().cpu()})
-                for key in ("conditioning_latents", "cond_indicator", "cond_mask", "padding_mask", "cond_to_concat", "prompt_embeds"):
-                    captured_condition[key] = values[key].detach().cpu()
+                for b in range(batch):
+                    trajectories[b].append({
+                        "step": 0, "timestep": float(timestep.item()),
+                        "latents": latents[b * views:(b + 1) * views].detach().cpu(),
+                    })
+                for key in ("conditioning_latents", "cond_indicator", "cond_mask", "padding_mask", "cond_to_concat"):
+                    captured_condition[key] = values[key][:views].detach().cpu()
+                # prompt_embeds has batch dim B (not B*v); keep the (1, seq, dim) shape.
+                captured_condition["prompt_embeds"] = values["prompt_embeds"][:1].detach().cpu()
 
         def on_end(_pipe: Any, index: int, timestep: torch.Tensor, values: dict[str, torch.Tensor]) -> dict[str, torch.Tensor]:
-            trajectory.append({"step": index + 1, "timestep": float(timestep.item()), "latents": values["latents"].detach().cpu()})
+            latents = values["latents"]
+            for b in range(batch):
+                trajectories[b].append({
+                    "step": index + 1, "timestep": float(timestep.item()),
+                    "latents": latents[b * views:(b + 1) * views].detach().cpu(),
+                })
             return values
 
-        generator = torch.Generator(device=self.device).manual_seed(int(seed))
         result = self.pipe.infer(
-            video=observation.permute(0, 2, 1, 3, 4).to(self.device),
-            cond_to_concat=rearrange(prepared.cond_to_concat, "c v t h w -> v c t h w"),
-            prompt=None if prepared.prompt_embeds is not None else [prompt],
-            prompt_embeds=None if prepared.prompt_embeds is None else prepared.prompt_embeds.to(self.device),
+            video=video.to(self.device),
+            cond_to_concat=cond_to_concat.to(self.device),
+            prompt=None if prompt_embeds is not None else [prompt] * batch,
+            prompt_embeds=prompt_embeds,
             negative_prompt=None, height=height, width=width, n_view=views,
             num_frames=int(self.config["rollout"]["future_frames"]),
-            num_inference_steps=int(self.config["rollout"]["reverse_denoise_steps"]),
+            num_inference_steps=n_steps,
             n_prev=int(self.config["rollout"]["history_frames"]), guidance_scale=1.0,
-            generator=generator,
-            conditioning_latents=None if prepared.memory_latents is None else prepared.memory_latents.to(self.device),
+            generator=generators,
+            conditioning_latents=memory,
             callback_on_step_start=on_start, callback_on_step_end=on_end,
             output_type="pt", postprocess_video=False,
         )["frames"]
-        if len(trajectory) != int(self.config["rollout"]["reverse_denoise_steps"]) + 1:
-            raise RuntimeError("pipeline did not expose the complete reverse trajectory")
+        for trajectory in trajectories:
+            if len(trajectory) != n_steps + 1:
+                raise RuntimeError("pipeline did not expose the complete reverse trajectory")
         if prepared.memory_latents is None:
             prepared.memory_latents = captured_condition["conditioning_latents"].clone()
             prepared.prompt_embeds = captured_condition["prompt_embeds"].clone()
@@ -200,23 +273,28 @@ class PersistentGeSimRuntime:
                 condition_mask=captured_condition["cond_mask"],
                 padding_mask=captured_condition["padding_mask"],
                 fps=16, n_view=views, n_previous=int(self.config["rollout"]["history_frames"]),
-                num_future_latent_frames=trajectory[-1]["latents"].shape[2],
+                num_future_latent_frames=trajectories[0][-1]["latents"].shape[2],
             )
-        torch.save({"chunks": [trajectory], "num_chunks": 1}, seed_dir / "trajectory.pt")
-        torch.save(trajectory[-1]["latents"], seed_dir / "final_future_latent.pt")
-        # The condition is identical for every seed in a group and can be very
-        # large, so store one shared copy instead of duplicating it per seed.
-        condition_path = seed_dir.parent / "condition.pt"
-        if not condition_path.exists():
-            torch.save(prepared.condition_template, condition_path)
-        videos = torch.cat((observation, result.detach().cpu()), dim=2).clamp(-1, 1)
-        for view, camera in enumerate(self.args.data["train"]["valid_cam"]):
-            save_video(videos[view], str(seed_dir / f"{camera}_color.mp4"), fps=16)
-        rollout_metadata = {
-            "condition_id": prepared.condition_id, "policy_version": self.policy_version,
-            "seed": int(seed), "num_chunks": 1,
-        }
-        (seed_dir / "rollout.json").write_text(json.dumps(rollout_metadata, indent=2), encoding="utf-8")
+        frames = result.detach().cpu()
+        artifacts = []
+        for b, seed in enumerate(seeds):
+            seed_dir = group_dir / f"seed_{seed}"
+            seed_dir.mkdir(parents=True, exist_ok=False)
+            future = frames[b * views:(b + 1) * views]
+            videos = torch.cat((observation, future), dim=2).clamp(-1, 1)
+            for view, camera in enumerate(self.args.data["train"]["valid_cam"]):
+                save_video(videos[view], str(seed_dir / f"{camera}_color.mp4"), fps=16)
+            rollout_metadata = {
+                "condition_id": prepared.condition_id, "policy_version": self.policy_version,
+                "seed": int(seed), "num_chunks": 1,
+            }
+            (seed_dir / "rollout.json").write_text(json.dumps(rollout_metadata, indent=2), encoding="utf-8")
+            artifacts.append(RolloutArtifact(
+                seed=int(seed), seed_dir=seed_dir,
+                trajectory=trajectories[b], final_future_latent=trajectories[b][-1]["latents"],
+                condition_template=prepared.condition_template,
+            ))
+        return artifacts
 
     def set_policy_version(self, version: int) -> None:
         if version < self.policy_version:

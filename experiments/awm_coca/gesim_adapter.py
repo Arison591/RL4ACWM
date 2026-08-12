@@ -76,7 +76,6 @@ class GeSimVelocityAdapter:
             time = time.expand(noisy_future.shape[0])
         if time.numel() != noisy_future.shape[0]:
             raise ValueError("flow_time batch does not match noisy latent batch")
-        sigma = time / (1.0 - time).clamp_min(1e-6)
         shaped_time = time.to(noisy_future.dtype).reshape(-1, 1, 1, 1, 1)
         c_in = 1.0 - shaped_time
         scaled_future = noisy_future * c_in
@@ -109,8 +108,9 @@ class GeSimVelocityAdapter:
                 return_video=True,
             )
         raw_future = _video_output(output)[:, :, condition.memory_latents.shape[2] :]
-        predicted_clean = (1.0 - shaped_time) * noisy_future + (-shaped_time) * raw_future.float()
-        return (noisy_future - predicted_clean) / sigma.reshape(-1, 1, 1, 1, 1).clamp_min(1e-5)
+        # 直接返回 transformer 原生 flow-matching 输出（target = noise - clean），
+        # 不做 sampler 侧 (noisy - predicted_clean)/sigma 的速度转换。
+        return raw_future.float()
 
     def policy_velocity(self, noisy_latent: torch.Tensor, noise_time: torch.Tensor, condition: GeSimConditionBatch) -> torch.Tensor:
         return self._velocity(noisy_latent, noise_time, condition, reference=False)
