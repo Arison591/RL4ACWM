@@ -26,7 +26,7 @@ bash scripts/train_remote.sh
 
 - 数据目录：目标训练机默认自动识别 `/hpc2hdd/home/bohantan/jhupload/hr_data`，其他机器回退到仓库根目录的 `dataset/`；
 - 模型目录：仓库根目录下的 `checkpoints/`；
-- 输出目录：目标训练机默认为数据盘下的 `/hpc2hdd/home/bohantan/jhupload/hr_data/awm_coca_outputs/`；其他机器没有外部数据盘时回退到 `outputs/awm_coca_remote/`；
+- 输出目录：每次新训练自动创建独立的 `awm_coca_outputs/runs/<timestamp_pid>/`；其他机器没有外部数据盘时使用 `outputs/awm_coca_remote/runs/<timestamp_pid>/`；
 - GPU：`CUDA_VISIBLE_DEVICES=0,1,2,3`；
 - 全局 `group_size=16`，每张 GPU 负责 4 条 rollout；
 - reward：50% Action + 50% 三视角 PSNR geometry；
@@ -88,7 +88,7 @@ export WANDB_PROJECT=awm-coca
 训练启动后，控制台会打印 run URL，并写入：
 
 ```text
-/hpc2hdd/home/bohantan/jhupload/hr_data/awm_coca_outputs/logs/wandb_run.txt
+/hpc2hdd/home/bohantan/jhupload/hr_data/awm_coca_outputs/runs/<timestamp_pid>/logs/wandb_run.txt
 ```
 
 把其中的 `url=` 发回来，即可在网页实时查看：loss、learning rate、gradient norm、
@@ -125,7 +125,8 @@ W&B，训练完成后仍按第 9 节打包回传。
 
 代码位于空间较小的 `workspace`，数据保留在 `jhupload/hr_data`，不需要复制或软链接到
 代码仓库。直接执行 `bash scripts/train_remote.sh` 时，脚本会优先自动识别该目录，并将
-checkpoint、rollout、日志等训练输出写入 `hr_data/awm_coca_outputs/`，避免占满 workspace。
+checkpoint、rollout、日志等训练输出写入 `hr_data/awm_coca_outputs/runs/<timestamp_pid>/`，
+避免占满 workspace，也避免失败后重启时与旧 rollout 的 policy/seed 目录冲突。
 
 数据集内部推荐结构：
 
@@ -257,6 +258,9 @@ OUTPUT_DIR=/data/train_outputs/awm_coca \
 bash scripts/train_remote.sh
 ```
 
+这里显式设置 `OUTPUT_DIR` 时，该目录本身就是本次 run 的目录；新训练不要复用已有
+rollout 的目录。一般直接使用默认自动创建的时间戳目录最省事。
+
 训练脚本默认使用 `ROLLOUT_RETENTION=videos`。每条 seed 保留 head、left-hand、right-hand
 三个 MP4，以及 `reward.json`、`credit.json`、`rollout.json`；完成梯度更新后自动删除：
 
@@ -288,26 +292,29 @@ condition，且梯度累积为 1，所以 1 epoch = 203 次 update，全部训�
 
 ```text
 /hpc2hdd/home/bohantan/jhupload/hr_data/awm_coca_outputs/
-  logs/
-    train_<timestamp>.log              # 完整 stdout/stderr
-    run_<timestamp>.txt                # Git、GPU、数据和路径信息
-    effective_config_<timestamp>.yaml  # 本次实际生效配置
-    wandb_run.txt                      # W&B 状态、run ID 和网页 URL
-  metrics/
-    train.jsonl                        # 每个 optimizer step 的 loss/grad/sample 指标
-    rollouts.jsonl                     # 每条 rollout 的 reward 和 CoCA 摘要
-  checkpoints/
-    checkpoint_100/
-    checkpoint_200/
-    ...
-  rollouts/                            # 默认仅保留 MP4、reward、credit 和元数据
+  runs/
+    <timestamp_pid>/                   # 每次启动的新训练互不覆盖
+      logs/
+        train_<timestamp_pid>.log      # 完整 stdout/stderr
+        run_<timestamp_pid>.txt        # Git、GPU、数据和路径信息
+        effective_config_<timestamp_pid>.yaml
+        wandb_run.txt                  # W&B 状态、run ID 和网页 URL
+      metrics/
+        train.jsonl                    # 每个 optimizer step 的 loss/grad/sample 指标
+        rollouts.jsonl                 # 每条 rollout 的 reward 和 CoCA 摘要
+      checkpoints/
+        checkpoint_100/
+        checkpoint_200/
+        ...
+      rollouts/                        # 默认仅保留 MP4、reward、credit 和元数据
 ```
 
 实时查看：
 
 ```bash
-tail -f /hpc2hdd/home/bohantan/jhupload/hr_data/awm_coca_outputs/logs/train_*.log
-tail -f /hpc2hdd/home/bohantan/jhupload/hr_data/awm_coca_outputs/metrics/train.jsonl
+latest_run="$(find /hpc2hdd/home/bohantan/jhupload/hr_data/awm_coca_outputs/runs -mindepth 1 -maxdepth 1 -type d | sort | tail -n 1)"
+tail -f "${latest_run}"/logs/train_*.log
+tail -f "${latest_run}"/metrics/train.jsonl
 nvidia-smi
 watch -n 30 df -h
 ```
@@ -322,11 +329,11 @@ Checkpoint 默认每 100 个 optimizer step 保存一次，包含：
 
 ## 8. 断点续训
 
-使用同一个 `OUTPUT_DIR`，指定完整 checkpoint：
+使用同一个 run 的 `OUTPUT_DIR`，指定完整 checkpoint：
 
 ```bash
-OUTPUT_DIR=/data/train_outputs/awm_coca \
-RESUME_CHECKPOINT=/data/train_outputs/awm_coca/checkpoints/checkpoint_500 \
+OUTPUT_DIR=/data/train_outputs/awm_coca/runs/20260812_205500_12345 \
+RESUME_CHECKPOINT=/data/train_outputs/awm_coca/runs/20260812_205500_12345/checkpoints/checkpoint_500 \
 bash scripts/train_remote.sh
 ```
 
@@ -338,7 +345,8 @@ bash scripts/train_remote.sh
 不需要回传 TB 级 rollout。执行：
 
 ```bash
-bash scripts/package_training_results.sh /hpc2hdd/home/bohantan/jhupload/hr_data/awm_coca_outputs
+latest_run="$(find /hpc2hdd/home/bohantan/jhupload/hr_data/awm_coca_outputs/runs -mindepth 1 -maxdepth 1 -type d | sort | tail -n 1)"
+bash scripts/package_training_results.sh "${latest_run}"
 ```
 
 脚本选择最新带 `COMPLETE` 标记的 checkpoint，并将以下内容打包：
@@ -351,8 +359,8 @@ bash scripts/package_training_results.sh /hpc2hdd/home/bohantan/jhupload/hr_data
 生成：
 
 ```text
-/hpc2hdd/home/bohantan/jhupload/hr_data/awm_coca_outputs/transfer/awm_coca_checkpoint_<step>_<timestamp>.tar.gz
-/hpc2hdd/home/bohantan/jhupload/hr_data/awm_coca_outputs/transfer/awm_coca_checkpoint_<step>_<timestamp>.tar.gz.sha256
+<latest_run>/transfer/awm_coca_checkpoint_<step>_<timestamp>.tar.gz
+<latest_run>/transfer/awm_coca_checkpoint_<step>_<timestamp>.tar.gz.sha256
 ```
 
 请将这两个文件一起传回。收到后先运行：

@@ -10,6 +10,8 @@ DATA_DIR="${DATA_DIR:-}"
 REMOTE_DATA_DIR="${REMOTE_DATA_DIR:-/hpc2hdd/home/bohantan/jhupload/hr_data}"
 MODEL_DIR="${MODEL_DIR:-${REPO_ROOT}/checkpoints}"
 OUTPUT_DIR="${OUTPUT_DIR:-}"
+OUTPUT_DIR_WAS_SET=0
+[[ -n "${OUTPUT_DIR}" ]] && OUTPUT_DIR_WAS_SET=1
 
 PYTHON_BIN="${PYTHON_BIN:-python}"
 NPROC_PER_NODE="${NPROC_PER_NODE:-4}"
@@ -135,14 +137,24 @@ else
 fi
 
 # 外部数据盘存在时，checkpoint、rollout 和日志也默认写到数据盘，避免占满 workspace。
+# 新训练每次创建独立 run 目录，防止上一次失败留下的 rollout 与 policy/seed 重名。
+# 断点续训必须显式传入原 OUTPUT_DIR 和 RESUME_CHECKPOINT。
 if [[ -z "${OUTPUT_DIR}" ]]; then
   if [[ -n "${DATA_DIR}" && "${DATA_DIR}" != "${REPO_ROOT}"/* ]]; then
-    OUTPUT_DIR="${DATA_DIR}/awm_coca_outputs"
+    OUTPUT_ROOT="${DATA_DIR}/awm_coca_outputs"
   else
-    OUTPUT_DIR="${REPO_ROOT}/outputs/awm_coca_remote"
+    OUTPUT_ROOT="${REPO_ROOT}/outputs/awm_coca_remote"
   fi
+  RUN_STAMP="$(date +%Y%m%d_%H%M%S)_$$"
+  OUTPUT_DIR="${OUTPUT_ROOT}/runs/${RUN_STAMP}"
 else
   OUTPUT_DIR="$(resolve_from_repo "${OUTPUT_DIR}")"
+  RUN_STAMP="$(date +%Y%m%d_%H%M%S)_$$"
+fi
+
+if [[ -n "${RESUME_CHECKPOINT}" && "${OUTPUT_DIR_WAS_SET}" -ne 1 ]]; then
+  echo "[ERROR] 断点续训必须同时设置 OUTPUT_DIR 和 RESUME_CHECKPOINT。" >&2
+  exit 2
 fi
 
 if [[ ! -d "${PREP_ROOT}" ]] || [[ -z "$(find "${PREP_ROOT}" -mindepth 2 -maxdepth 2 -name actions.npy -type f -print -quit)" ]]; then
@@ -159,7 +171,6 @@ if [[ ! -d "${GT_ROOT}" ]] || [[ -z "$(find "${GT_ROOT}" -mindepth 2 -maxdepth 2
 fi
 
 mkdir -p "${OUTPUT_DIR}/logs"
-RUN_STAMP="$(date +%Y%m%d_%H%M%S)"
 CONSOLE_LOG="${OUTPUT_DIR}/logs/train_${RUN_STAMP}.log"
 METADATA_FILE="${OUTPUT_DIR}/logs/run_${RUN_STAMP}.txt"
 EFFECTIVE_CONFIG="${OUTPUT_DIR}/logs/effective_config_${RUN_STAMP}.yaml"
