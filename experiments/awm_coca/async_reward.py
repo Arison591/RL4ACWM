@@ -24,14 +24,31 @@ class RewardResult:
 
 
 class AsyncRewardRunner:
-    def __init__(self, reward_fn: Callable[[Any], dict[str, Any]], *, workers: int = 1) -> None:
+    def __init__(
+        self,
+        reward_fn: Callable[[Any], dict[str, Any]],
+        *,
+        workers: int = 1,
+        cuda_device: int | None = None,
+    ) -> None:
         if workers <= 0:
             raise ValueError("reward workers must be positive")
+        if cuda_device is not None and cuda_device < 0:
+            raise ValueError("reward CUDA device must be non-negative")
         self.reward_fn = reward_fn
+        self.cuda_device = cuda_device
         self.executor = ThreadPoolExecutor(max_workers=workers, thread_name_prefix="awm-reward")
 
     def submit(self, request: RewardRequest) -> Future[RewardResult]:
         def run() -> RewardResult:
+            # CUDA current device is thread-local.  torchrun binds the training
+            # thread to LOCAL_RANK, but a fresh ThreadPoolExecutor worker starts
+            # on logical cuda:0 unless it is bound again here.  Reward models
+            # are lazy-loaded in this worker, so bind before invoking reward_fn.
+            if self.cuda_device is not None:
+                import torch
+
+                torch.cuda.set_device(self.cuda_device)
             reward = self.reward_fn(request.payload)
             return RewardResult(request.sample_id, request.condition_id, request.policy_version,
                                 request.seed, reward)

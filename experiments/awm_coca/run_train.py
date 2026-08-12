@@ -528,11 +528,21 @@ def train(config: dict[str, Any], *, resume: str | None = None, device: str = "c
             f"[INFO] 训练长度：{max_steps} 次 optimizer update；"
             f"每轮 {conditions_per_epoch} 个 condition；约 {estimated_total_epochs:.2f} 个 epoch"
         )
+    reward_cuda_device = None
+    if runtime.device.type == "cuda":
+        reward_cuda_device = runtime.device.index
+        if reward_cuda_device is None:
+            reward_cuda_device = torch.cuda.current_device()
+        progress.write(
+            f"[INFO][rank {rank}] 训练与 reward worker 绑定 logical cuda:{reward_cuda_device}"
+        )
     with (
         progress,
         WandbMonitor(config, output, enabled=rank == 0) as monitor,
         AsyncRewardRunner(
-            _reward_function(config), workers=int(config["reward"].get("workers", 1))
+            _reward_function(config),
+            workers=int(config["reward"].get("workers", 1)),
+            cuda_device=reward_cuda_device,
         ) as rewards,
     ):
         checkpoint_writer = AsyncCheckpointWriter() if rank == 0 else None
