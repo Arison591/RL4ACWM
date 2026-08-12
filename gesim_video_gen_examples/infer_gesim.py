@@ -1,5 +1,6 @@
 import os, random, math
 import sys
+import gc
 sys.path.insert(0, os.path.dirname(os.path.dirname(__file__)))
 
 from pathlib import Path
@@ -175,7 +176,8 @@ def load_cam_infos(extrinsic_root, intrinsic_root, valid_cams, orisize=None, siz
 
 def infer(
     config_file, image_root, extrinsic_root, intrinsic_root, action_path, prompt, save_path,
-    seed=42, device="cuda", default_fps=30
+    seed=None, device="cuda", default_fps=30, split_views=False, denoise_interval=0,
+    save_trajectory=False, trajectory_path=None,
 ):
 
     args = load_config(config_file)
@@ -250,8 +252,76 @@ def infer(
 
     trajs = ichunk_cond_to_concat[:3].clone()
 
+    # seed=None 时不固定随机种子（沿用当前全局 RNG 行为）；seed 给定则复现逐 chunk 采样
+    generator = None
+    if seed is not None:
+        generator = torch.Generator(device=device).manual_seed(seed)
+
+    # 去噪中间检查点：每 denoise_interval 步用 callback 捕获当前 latents（CPU 小张量），
+    # 全部 chunk 跑完后统一解码成帧，写入 {save_path}/denoise_<step>/{cam}.mp4。
+    # 延迟到末尾解码（而非每 chunk 立即 decode），避开去噪循环期间的显存峰值。
+    cam_names = args.data["train"]["valid_cam"]
+    denoise_steps = set()
+    if denoise_interval > 0:
+        denoise_steps = set(range(denoise_interval, args.num_inference_step + 1, denoise_interval))
+        denoise_steps.add(1)
+        # 最终去噪步始终保存，即使 num_inference_step 不是 interval 的整数倍。
+        denoise_steps.add(args.num_inference_step)
+    checkpoint_latents = {}  # (chunk_idx, step) -> latents (cpu clone)
+    captured = {}  # step -> latents (cpu clone)，仅当前 chunk 有效
+    trajectory_chunks = []
+    current_trajectory = None
+
+    # checkpoint 解码发生在 pipe.infer() 外部；pipe.infer() 自身虽然有
+    # @torch.no_grad()，但这里不会自动继承该上下文。必须把整个 VAE
+    # forward 包在 inference_mode 中，否则 VAE 会为每个中间视频构建
+    # 完整 autograd graph，导致解码峰值显存远高于正常生成路径。
+    def _decode_latents(lat):
+        with torch.inference_mode():
+            lat = lat.to(device=device, dtype=vae.dtype)
+            lat_mean = torch.tensor(
+                vae.config.latents_mean,
+                device=lat.device,
+                dtype=lat.dtype,
+            ).view(1, vae.z_dim, 1, 1, 1)
+            lat_std = torch.tensor(
+                vae.config.latents_std,
+                device=lat.device,
+                dtype=lat.dtype,
+            ).view(1, vae.z_dim, 1, 1, 1)
+            return vae.decode(
+                lat * lat_std / scheduler.config.sigma_data + lat_mean,
+                return_dict=False,
+            )[0]
+
+    def _cb(pipe_, i, t, ck):
+        step = i + 1
+        if current_trajectory is not None:
+            row = {
+                "step": step,
+                "timestep": float(t.item()) if torch.is_tensor(t) else float(t),
+                "latents": ck["latents"].detach().cpu().clone(),
+            }
+            if "denoised" in ck:
+                row["denoised"] = ck["denoised"].detach().cpu().clone()
+            current_trajectory.append(row)
+        if step in denoise_steps:
+            # For a denoising preview, decode the model's clean estimate x_0,
+            # not the still-noisy state x_t used by CoCA trajectory analysis.
+            captured[step] = ck.get("denoised", ck["latents"]).detach().cpu().clone()
+        return ck
+
+    def _cb_start(pipe_, i, t, ck):
+        if current_trajectory is not None and not current_trajectory:
+            current_trajectory.append({
+                "step": 0,
+                "timestep": float(t.item()) if torch.is_tensor(t) else float(t),
+                "latents": ck["latents"].detach().cpu().clone(),
+            })
 
     for ichunk in range(nchunk):
+
+        current_trajectory = [] if save_trajectory else None
 
         preds = pipe.infer(
             video=obs.permute(0,2,1,3,4).to(device), # -> v, t, c, h, w
@@ -266,13 +336,26 @@ def infer(
             n_prev=args.data['train']['n_previous'],
             guidance_scale=1.0,
             merge_view_into_width=False,
+            generator=generator,
+            callback_on_step_end=_cb if (denoise_interval > 0 or save_trajectory) else None,
+            callback_on_step_end_tensor_inputs=["latents", "denoised"],
+            callback_on_step_start=_cb_start if save_trajectory else None,
             output_type="pt",
             postprocess_video=False,
         )['frames'] # preds: v c t h w , range -1 to 1 (could exceed range)
 
+        if save_trajectory:
+            trajectory_chunks.append(current_trajectory)
+            current_trajectory = None
+
         videos = torch.cat((videos, preds.data.cpu()), dim=2) # v c t h w
 
         videos = torch.clamp(videos, min=-1, max=1)
+
+        if denoise_interval > 0 and captured:
+            for step, lat in captured.items():
+                checkpoint_latents[(ichunk, step)] = lat
+            captured.clear()
 
         if ichunk < nchunk-1:
             ### update memories and conditions
@@ -288,13 +371,87 @@ def infer(
             if ichunk_cond_to_concat.shape[2]<args.data['train']['chunk']+args.data['train']['n_previous']:
                 ichunk_cond_to_concat = torch.cat([ichunk_cond_to_concat,] + [ichunk_cond_to_concat[:,:,-1:],]*(args.data['train']['chunk']-ichunk_cond_to_concat.shape[2]-args.data['train']['n_previous']), dim=2)
 
-    video_to_save = torch.cat((rearrange(videos[:,:,:ori_trajs.shape[2]], 'v c t h w -> c t h (v w)', v=v), rearrange(ori_trajs, 'c v t h w -> c t h (v w)', v=v),), dim=2)
+    n_total = ori_trajs.shape[2]
+    video_to_save = torch.cat((rearrange(videos[:,:,:n_total], 'v c t h w -> c t h (v w)', v=v), rearrange(ori_trajs, 'c v t h w -> c t h (v w)', v=v),), dim=2)
 
     save_video(
         video_to_save,
         os.path.join(save_path, "video.mp4"),
         fps=video_fps
     )
+
+    if save_trajectory or trajectory_path:
+        trajectory_path = trajectory_path or os.path.join(save_path, "rollout", "trajectory.pt")
+        os.makedirs(os.path.dirname(trajectory_path), exist_ok=True)
+        torch.save({
+            "chunks": trajectory_chunks,
+            "num_chunks": nchunk,
+            "num_inference_steps": args.num_inference_step,
+            "valid_cams": cam_names,
+            "seed": seed,
+            "config_file": config_file,
+            "includes_initial_latent": True,
+            "includes_predicted_x0": True,
+        }, trajectory_path)
+        with open(os.path.splitext(trajectory_path)[0] + "_meta.json", "w", encoding="utf-8") as f:
+            json.dump({
+                "num_chunks": nchunk,
+                "num_inference_steps": args.num_inference_step,
+                "valid_cams": cam_names,
+                "seed": seed,
+                "config_file": config_file,
+                "includes_initial_latent": True,
+                "includes_predicted_x0": True,
+            }, f, indent=2, ensure_ascii=False)
+
+    if split_views:
+        for i, cam_name in enumerate(cam_names):
+            view_video = videos[i, :, :n_total, :, :]
+            save_video(
+                view_video,
+                os.path.join(save_path, f"{cam_name}.mp4"),
+                fps=video_fps
+            )
+
+    # 主视频/单视角已保存。检查点解码只需要 VAE，把不再用的扩散模型、
+    # 文本编码器与数据张量全部释放出显存后再逐个解码（共享 GPU 上剩余显存不足）。
+    if checkpoint_latents:
+        prefix = videos[:, :, :args.data['train']['n_previous']].detach().cpu()
+        del video_to_save, videos, ori_trajs, cond_to_concat, ichunk_cond_to_concat
+        del obs, trajs, preds, generator
+        del diffusion_model, text_encoder, pipe, tokenizer
+        gc.collect()  # 破除 apply_forward_hook 等 module↔hook 引用环，del 不触发回收
+        torch.cuda.empty_cache()
+        print(f"[INFO] 主生成释放后显存: allocated={torch.cuda.memory_allocated()/1024**3:.2f} GiB "
+              f"reserved={torch.cuda.memory_reserved()/1024**3:.2f} GiB")
+
+        # 逐 step 处理：把该 step 各 chunk 的 latents 解码拼成完整视频 -> 立刻保存 -> 释放。
+        # 避免原实现「先解码全部 (step,chunk) 再统一保存」，峰值随步数×块数线性增长。
+        for step in sorted({s for (_, s) in checkpoint_latents}):
+            ckpt_dir = os.path.join(save_path, f"denoise_{step}")
+            os.makedirs(ckpt_dir, exist_ok=True)
+            ckpt = prefix.clone()  # v c t h w（n_previous 帧）
+            ok = False
+            for chunk_idx in sorted({c for (c, s) in checkpoint_latents if s == step}):
+                torch.cuda.empty_cache()
+                try:
+                    if hasattr(vae, "clear_cache"):
+                        vae.clear_cache()
+                    # _decode_latents 输出 (b v) c t h w，b=1 时即 v c t h w
+                    vid = _decode_latents(checkpoint_latents[(chunk_idx, step)]).detach().cpu().to(prefix.dtype)
+                except Exception as e:
+                    print(f"[WARN] denoise_{step}（chunk {chunk_idx}）解码失败，跳过该 chunk: {e}")
+                    continue
+                ckpt = torch.cat((ckpt, vid), dim=2)
+                ok = True
+                del vid
+            if not ok:
+                continue
+            ckpt = torch.clamp(ckpt[:, :, :n_total], min=-1, max=1)
+            for j, cam_name in enumerate(cam_names):
+                save_video(ckpt[j], os.path.join(ckpt_dir, f"{cam_name}.mp4"), fps=video_fps)
+            del ckpt
+            torch.cuda.empty_cache()
 
 
 def args_parser():
@@ -308,6 +465,11 @@ def args_parser():
     parser.add_argument('--action_path', type=str, required=True, help='Path to actions')
     parser.add_argument('--output_path', type=str, required=True, help='Path to save outputs, used in inference stage only')
     parser.add_argument('--prompt', type=str, default="best quality, consistent and smooth motion, realistic, clear and distinct.")
+    parser.add_argument('--split_views', action='store_true', help='Also save each camera view as a separate mp4 file')
+    parser.add_argument('--seed', type=int, default=None,
+                        help='Noise seed for reproducibility; None = do not fix seed (default behavior, non-deterministic)')
+    parser.add_argument('--denoise-interval', type=int, default=0,
+                        help='每 N 个去噪步保存一个中间视频到 {output_path}/denoise_<step>/；0 = 关闭（默认）')
     args = parser.parse_args()
     return args
 
@@ -321,5 +483,6 @@ if __name__ == "__main__":
     print(args)
 
     infer(
-        args.config_file, args.image_root, args.extrinsic_root, args.intrinsic_root, args.action_path, args.prompt, args.output_path
+        args.config_file, args.image_root, args.extrinsic_root, args.intrinsic_root, args.action_path, args.prompt, args.output_path,
+        seed=args.seed, split_views=args.split_views, denoise_interval=args.denoise_interval
     )

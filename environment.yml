@@ -1,0 +1,67 @@
+name: genie-psnr
+
+channels:
+  - pytorch
+  - nvidia
+  - conda-forge
+
+dependencies:
+  - python=3.10
+  - pip
+  - setuptools
+  - wheel
+  - git
+  - git-lfs
+  - curl
+  - ffmpeg
+  - pip:
+      # 当前单卡真实训练验证所用的 CUDA 12.6 PyTorch 组合。
+      - --extra-index-url https://download.pytorch.org/whl/cu126
+      - torch==2.7.1
+      - torchvision==0.22.1
+      - xformers==0.0.31.post1
+      - torchao==0.12.0
+
+      # GE-Sim / LoRA 训练。
+      - transformers==4.51.3
+      - diffusers==0.32.0
+      - accelerate==1.0.0
+      - deepspeed==0.15.3
+      - peft==0.10.0
+      - safetensors==0.6.2
+      - sentencepiece==0.2.0
+      - huggingface-hub==0.36.2
+      - tensorboard==2.21.0
+      - wandb==0.28.1
+
+      # 视频、数值与配置。
+      - numpy==2.2.6
+      - scipy==1.15.3
+      - opencv-python==4.10.0.84
+      - Pillow==11.3.0
+      - av==17.1.0
+      - decord==0.6.0
+      - imageio==2.37.4
+      - imageio-ffmpeg==0.6.0
+      - matplotlib==3.10.5
+      - einops==0.8.1
+      - PyYAML==6.0.2
+      - tqdm==4.67.1
+      - pandas==2.3.1
+      - psutil==7.2.2
+
+      # Action / geometry reward：SAM3、YOLO-World、CoWTracker。
+      - timm==1.0.28
+      - ultralytics==8.4.115
+      - iopath==0.1.10
+      - ftfy==6.1.1
+      - regex==2026.7.19
+      - pycocotools==2.0.11
+      - hydra-core==1.3.4
+      - omegaconf==2.3.1
+
+      # 编译、日志及运行时辅助。
+      - ninja==1.13.0
+      - packaging==24.2
+      - protobuf==7.35.1
+      - rich==13.4.2

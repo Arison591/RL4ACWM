@@ -16,7 +16,7 @@
 
 
 import inspect
-from typing import Callable, Dict, List, Optional, Union
+from typing import Any, Callable, Dict, List, Optional, Union
 
 import numpy as np
 import os.path as osp
@@ -146,7 +146,7 @@ class GeSimCosmos2Pipeline(DiffusionPipeline):
     """
 
     model_cpu_offload_seq = "text_encoder->transformer->vae"
-    _callback_tensor_inputs = ["latents", "prompt_embeds", "negative_prompt_embeds"]
+    _callback_tensor_inputs = ["latents", "denoised", "prompt_embeds", "negative_prompt_embeds"]
     # We mark safety_checker as optional here to get around some test failures, but it is not really optional
     _optional_components = ["safety_checker"]
 
@@ -392,6 +392,7 @@ class GeSimCosmos2Pipeline(DiffusionPipeline):
         callback_on_step_end: Optional[
             Union[Callable[[int, int, Dict], None], PipelineCallback, MultiPipelineCallbacks]
         ] = None,
+        callback_on_step_start: Optional[Callable[[Any, int, Any, Dict], Optional[Dict]]] = None,
         callback_on_step_end_tensor_inputs: List[str] = ["latents"],
         max_sequence_length: int = 512,
         sigma_conditioning: float = 0.0001,
@@ -587,6 +588,24 @@ class GeSimCosmos2Pipeline(DiffusionPipeline):
                 if self.interrupt:
                     continue
 
+                if callback_on_step_start is not None:
+                    callback_outputs = callback_on_step_start(
+                        self,
+                        i,
+                        t,
+                        {
+                            "latents": latents,
+                            "conditioning_latents": conditioning_latents,
+                            "cond_indicator": cond_indicator,
+                            "cond_mask": cond_mask,
+                            "padding_mask": padding_mask,
+                            "cond_to_concat": cond_to_concat,
+                            "prompt_embeds": prompt_embeds,
+                        },
+                    )
+                    if callback_outputs is not None:
+                        latents = callback_outputs.pop("latents", latents)
+
                 self._current_timestep = t
                 current_sigma = self.scheduler.sigmas[i]
 
@@ -666,7 +685,11 @@ class GeSimCosmos2Pipeline(DiffusionPipeline):
                     # )
                     noise_pred = noise_pred + self.guidance_scale * (noise_pred - noise_pred_uncond)
 
-                noise_pred = (latents - noise_pred) / current_sigma
+                # `denoised` is the model's clean-latent estimate at the current
+                # noise level.  It is distinct from `latents`, which remains x_t
+                # and can look noisy when decoded early in the reverse process.
+                denoised = noise_pred
+                noise_pred = (latents - denoised) / current_sigma
                 latents = self.scheduler.step(noise_pred, t, latents, return_dict=False)[0]
 
                 if callback_on_step_end is not None:

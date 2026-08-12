@@ -1,0 +1,103 @@
+output_dir: outputs/awm_coca
+seed: 42
+max_optimizer_steps: 1000
+
+dataset:
+  # 相对路径从仓库根目录解析，也支持 ${DATA_ROOT} 这类环境变量。
+  prep_root: output/prep
+  validation_mode: strict
+  include_samples: []
+  exclude_samples: []
+  limit: 0
+  num_workers: 4
+  pin_memory: true
+  persistent_workers: true
+  prefetch_factor: 2
+
+model:
+  gesim_config: configs/cosmos_model/acwm_cosmos.yaml
+  checkpoint_root: checkpoints
+  train_mode: lora
+  lora_rank: 32
+  lora_alpha: 64
+  lora_dropout: 0.0
+  lora_init: gaussian
+  dtype: bf16
+  gradient_checkpointing: true
+
+rollout:
+  history_frames: 4
+  future_frames: 25
+  total_frames: 29
+  chunks: 1
+  group_size: 16
+  reverse_denoise_steps: 15
+  fresh_on_policy: true
+
+proposal:
+  num_training_noise_levels: 7
+  base_probabilities: [0.142857142857, 0.142857142857, 0.142857142857, 0.142857142857, 0.142857142857, 0.142857142857, 0.142857142857]
+  eta: 0.9
+  temperature: 1.0
+  coca_window_size: 3
+  # 可选的 p(k)/q(k) 上限；null 表示保持无偏 importance ratio。
+  importance_clipping: null
+
+optimizer:
+  learning_rate: 1.0e-6
+  betas: [0.9, 0.999]
+  epsilon: 1.0e-8
+  weight_decay: 0.0
+  max_grad_norm: 1.0
+  gradient_accumulation_steps: 1
+  warmup_steps: 100
+  reference_kl_beta: 0.01
+
+ema:
+  enabled: true
+  decay: 0.999
+
+checkpoint:
+  every_optimizer_steps: 100
+
+storage:
+  # 正式训练默认保留 MP4、reward、credit 和元数据，删除 condition/trajectory/final latent。
+  # 可选 all（全保留）、videos（推荐）、none（整个 group 删除）。
+  rollout_retention: videos
+
+reward:
+  # {condition_id} 会替换成预处理样本目录名。
+  gt_video_template: data/agibotworld_beta/selected_samples/samples/{condition_id}/head_29_frames.mp4
+  gt_video_templates:
+    head: data/agibotworld_beta/selected_samples/samples/{condition_id}/head_29_frames.mp4
+    hand_left: data/agibotworld_beta/selected_samples/samples/{condition_id}/hand_left_29_frames.mp4
+    hand_right: data/agibotworld_beta/selected_samples/samples/{condition_id}/hand_right_29_frames.mp4
+  # 联合奖励：Action 与三视角 PSNR geometry 各占 50%。
+  mode: joint
+  workers: 1
+  timeout_seconds: null
+  max_frames: 29
+  segmentation_prompt: robot arm
+  confidence: 0.1
+  # 训练保持三项等权；评估配置中的 0.2/0.1/0.7 是另一套实验假设，校准前不采用。
+  action_metric_weights:
+    mean_iou: 0.3333333333333333
+    af_fdce_ate_norm: 0.3333333333333333
+    fdce: 0.3333333333333333
+  af_fdce_ate_norm_scale: 0.2
+  fdce_scale: 10.0
+  fdce_k: 16
+  fdce_visibility_threshold: 0.5
+  fdce_min_visible_fraction: 0.8
+  fdce_min_common_frames: 1
+  fdce_seed: 0
+  geometry_enabled: true
+  geometry_cameras: [head, hand_left, hand_right]
+  geometry_future_start: 4
+  geometry_future_end: 28
+  geometry_mean_weight: 0.6
+  geometry_worst_weight: 0.4
+  geometry_psnr_center_db: 20.4
+  geometry_psnr_temperature_db: 1.8
+  action_weight: 0.5
+  geometry_weight: 0.5
