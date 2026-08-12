@@ -436,7 +436,16 @@ def train(config: dict[str, Any], *, resume: str | None = None, device: str = "c
     if world_size > 1:
         dist.barrier()
     runtime = PersistentGeSimRuntime(config, device=device)
-    runtime.scheduler.set_timesteps(int(config["rollout"]["reverse_denoise_steps"]), device=runtime.device)
+    # The GE-Sim rollout pipeline re-derives its own sigma schedule inside
+    # infer() (gesim_pipeline.py uses sigmas=linspace(0,1,N), then applies the
+    # configured invert_sigmas/shift). Replicate that exact call here so the AWM
+    # training noise levels fall in the same flow-time range as the reverse
+    # trajectory. Using the scheduler's default (EDM sigma_max=80) schedule
+    # instead puts ~all levels near pure noise (flow_time ~0.92-0.99), which
+    # decouples the CoCA bins (spanning t in [0,0.5]) from the levels' noise.
+    n_rollout = int(config["rollout"]["reverse_denoise_steps"])
+    rollout_sigmas = torch.linspace(0, 1, n_rollout, dtype=torch.float64)
+    runtime.scheduler.set_timesteps(sigmas=rollout_sigmas, device=runtime.device)
     noise_levels = build_training_noise_levels(runtime.scheduler, int(config["proposal"]["num_training_noise_levels"]))
     proposal = ProposalConfig(
         noise_levels=tuple(level.flow_time for level in noise_levels),

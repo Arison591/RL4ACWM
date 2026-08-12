@@ -1,0 +1,45 @@
+rollout:
+  config_file: configs/cosmos_model/acwm_cosmos.yaml
+  save_reverse_latents: true
+  save_video: true
+
+reward:
+  # Head-only action-following reward. The weights are an explicit evaluation
+  # hypothesis: prioritize displacement fidelity, then mask overlap and command error.
+  action_camera: head
+  geometry_cameras: [head, hand_left, hand_right]
+  prompt: robot arm
+  # Existing action-following batch/FDCE entry points use confidence=0.1.
+  confidence: 0.1
+  # FDCE protocol in eval_action_following_fdce.py: frame 0 + 48 rollout frames.
+  max_frames: 49
+  action_metric_weights:
+    mean_iou: 0.2
+    af_fdce_ate_norm: 0.1
+    fdce: 0.7
+  # af_fdce_ate_norm is normalized by image diagonal; 0.2 corresponds to
+  # 128 px at the 384x512 protocol resolution and is near the reported median
+  # command-following error (~103 px / 640 px).
+  af_fdce_ate_norm_scale: 0.2
+  # FDCE report tiers: <=2 excellent, <=5 good, <=10 passing, >10 failure.
+  fdce_scale: 10.0
+  # Values copied from eval_action_following_fdce.py protocol.
+  fdce_k: 16
+  fdce_visibility_threshold: 0.5
+  fdce_min_visible_fraction: 0.8
+  fdce_min_common_frames: 1
+  # Fixed anchor sampling seed makes GT/Pred and repeated evaluations comparable.
+  fdce_seed: 0
+
+geometry:
+  enabled: false
+  placeholder: true
+
+coca:
+  # Cosmos config uses K=15 reverse denoise steps; 3 gives 5 equal windows.
+  window_size: 3
+  # AWM reference implementation uses four discrete training levels.
+  num_training_noise_levels: 4
+  # Softmax temperature for the direct CoCA distribution q(k); must be
+  # calibrated by the credit study.
+  temperature: 1.0

@@ -385,6 +385,7 @@ class GeSimCosmos2Pipeline(DiffusionPipeline):
         num_videos_per_prompt: Optional[int] = 1,
         generator: Optional[Union[torch.Generator, List[torch.Generator]]] = None,
         latents: Optional[torch.Tensor] = None,
+        conditioning_latents: Optional[torch.Tensor] = None,
         prompt_embeds: Optional[torch.Tensor] = None,
         negative_prompt_embeds: Optional[torch.Tensor] = None,
         output_type: Optional[str] = "pil",
@@ -564,6 +565,7 @@ class GeSimCosmos2Pipeline(DiffusionPipeline):
             device,
             generator,
             latents,
+            conditioning_latents,
         )  # indicator and mask here are all about memory video, action condition not included
            # latents here only contains future
         unconditioning_latents = None
@@ -769,6 +771,7 @@ class GeSimCosmos2Pipeline(DiffusionPipeline):
         device: Optional[torch.device] = None,
         generator: Optional[Union[torch.Generator, List[torch.Generator]]] = None,
         latents: Optional[torch.Tensor] = None,
+        conditioning_latents: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         if isinstance(generator, list) and len(generator) != batch_size:
             raise ValueError(
@@ -778,17 +781,24 @@ class GeSimCosmos2Pipeline(DiffusionPipeline):
 
         num_cond_frames = video.size(2)
         num_cond_latent_frames = num_cond_frames  # encode memory separately
-        init_latents = [retrieve_latents(self.vae.encode(video[:, :, it].unsqueeze(2)), generator) for it in range(video.size(2))]
+        if conditioning_latents is None:
+            init_latents = [
+                retrieve_latents(self.vae.encode(video[:, :, it].unsqueeze(2)), sample_mode="argmax")
+                for it in range(video.size(2))
+            ]
+            init_latents = torch.cat(init_latents, dim=2).to(dtype)
 
-        init_latents = torch.cat(init_latents, dim=2).to(dtype)
-
-        latents_mean = (
-            torch.tensor(self.vae.config.latents_mean).view(1, self.vae.config.z_dim, 1, 1, 1).to(device, dtype)
-        )
-        latents_std = (
-            torch.tensor(self.vae.config.latents_std).view(1, self.vae.config.z_dim, 1, 1, 1).to(device, dtype)
-        )
-        init_latents = (init_latents - latents_mean) / latents_std * self.scheduler.config.sigma_data  # sigma_data=1.0
+            latents_mean = (
+                torch.tensor(self.vae.config.latents_mean).view(1, self.vae.config.z_dim, 1, 1, 1).to(device, dtype)
+            )
+            latents_std = (
+                torch.tensor(self.vae.config.latents_std).view(1, self.vae.config.z_dim, 1, 1, 1).to(device, dtype)
+            )
+            init_latents = (init_latents - latents_mean) / latents_std * self.scheduler.config.sigma_data
+        else:
+            init_latents = conditioning_latents.to(device=device, dtype=dtype)
+            if init_latents.shape[0] != batch_size or init_latents.shape[2] != num_cond_latent_frames:
+                raise ValueError("precomputed conditioning_latents shape does not match video batch/history")
 
         num_latent_frames = (num_frames - 1) // self.vae_scale_factor_temporal + 1
         latent_height = height // self.vae_scale_factor_spatial

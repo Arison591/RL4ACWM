@@ -150,7 +150,13 @@ def awm_coca_sample_loss(
         importance = importance.clamp(max=proposal_config.importance_clipping)
     time = torch.tensor([proposal_config.noise_levels[level]], device=clean.device, dtype=clean.dtype)
     noise = torch.randn(clean.shape, device=clean.device, dtype=clean.dtype, generator=generator)
-    noisy = forward_noise(clean, noise, time)
+    # flow_time t = sigma/(sigma+1) is the GE-Sim model timestep (gesim_pipeline
+    # feeds current_t = sigma/(sigma+1)). The forward interpolation coefficient
+    # must instead be the scheduler sigma, sigma = t/(1-t): feeding the model a
+    # latent noised with t while conditioning on timestep t would give an
+    # out-of-distribution pair whose velocity is (1-t)(eps-x0), not eps-x0.
+    sigma = time / (1.0 - time).clamp_min(1e-6)
+    noisy = forward_noise(clean, noise, sigma)
     target = noise - clean
     prediction = adapter.policy_velocity(noisy, time, sample.condition)
     with torch.no_grad():
