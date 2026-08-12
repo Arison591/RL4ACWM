@@ -63,6 +63,13 @@ conda env create -f environment.yml
 conda activate genie-psnr
 ```
 
+如果之前已经创建过 `genie-psnr` 环境，拉取本次更新后执行：
+
+```bash
+conda env update -n genie-psnr -f environment.yml --prune
+conda activate genie-psnr
+```
+
 依赖统一由 `environment.yml` 提供（仓库已移除 `requirements.txt`），请勿再单独执行 `pip install -r requirements.txt` 或 `pip install` 其他依赖文件，以免覆盖已锁定的版本。
 
 ## 2. W&B 实时训练日志
