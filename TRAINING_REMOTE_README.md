@@ -230,6 +230,9 @@ CoWTracker 权重采用 CC-BY-NC-4.0，运行下载脚本前请确认训练用�
 5. Action/geometry reward 所需的三个 GT 视频；
 6. GE-Sim 配置与 15 步 reverse denoise 设置。
 
+多卡训练中的 reward 是每个 rank 独立推理：SAM3 在本 rank 当前 GPU 上强制使用单进程
+模式，不参与训练进程组的 collective，避免异步 reward 与训练 all-reduce 次序冲突。
+
 也可以手动执行：
 
 ```bash

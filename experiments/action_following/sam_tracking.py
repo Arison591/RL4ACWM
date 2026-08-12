@@ -31,6 +31,27 @@ SAM3_CKPT = f"{_PROJECT_ROOT}/checkpoints/sam3.pt"
 _sam3_video = None
 
 
+def _force_rank_local_inference(model):
+    """Keep reward-side SAM3 independent from the trainer process group.
+
+    ``torchrun`` exports RANK/WORLD_SIZE for AWM training.  SAM3 reads those
+    variables in its constructors and otherwise assumes that all trainer ranks
+    jointly execute one SAM3 inference, issuing collectives from reward worker
+    threads.  In this project every rank evaluates its own local rollouts, so
+    SAM3 must remain a single-process model on that rank's current CUDA device.
+    """
+    detector = getattr(model, "detector", None)
+    if detector is None or not hasattr(model, "rank") or not hasattr(model, "world_size"):
+        raise TypeError("unexpected SAM3 video model: missing distributed inference attributes")
+    if not hasattr(detector, "rank") or not hasattr(detector, "world_size"):
+        raise TypeError("unexpected SAM3 detector: missing distributed inference attributes")
+    model.rank = 0
+    model.world_size = 1
+    detector.rank = 0
+    detector.world_size = 1
+    return model
+
+
 def get_sam3_video_model():
     """SAM3 video model 懒加载单例（优先本地 checkpoint）。"""
     global _sam3_video
@@ -44,6 +65,7 @@ def get_sam3_video_model():
     _sam3_video = build_sam3_video_model(
         device=device, checkpoint_path=SAM3_CKPT, load_from_HF=False
     )
+    _force_rank_local_inference(_sam3_video)
     _sam3_video.eval()
     return _sam3_video
 

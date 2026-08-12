@@ -103,6 +103,10 @@ data/agibotworld_beta/selected_samples/samples/<condition_id>/
 7. 根据 reverse trajectory 计算 CoCA credit 和噪声 proposal。
 8. 使用全局 group reward 计算 leave-one-out advantage，逐条 rollout 反传 LoRA。
 
+四卡训练时，每个 rank 在自己的 GPU 上独立计算本地 rollout 的 SAM3/CoWTracker/YOLO
+奖励。SAM3 会被显式设为 rank-local 单进程推理（`world_size=1`），不会复用训练进程组
+执行其内部 `all_gather`；奖励完成后才进入训练侧的跨 rank gather/all-reduce。
+
 Loader 会拒绝以下数据：
 
 - policy version 已过期；
