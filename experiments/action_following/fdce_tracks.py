@@ -123,7 +123,15 @@ def sample_tracks(dense, mask, anchors=None, *, k: int = 16, seed: int = 0):
             raise ValueError(f"mask 需为 ({T},{H},{W}) bool，收到 {M.shape}")
         if M.shape[0] != T:
             M = M[_align_index(M.shape[0], T)]             # 对齐到 dense 帧数
-        out_vis &= M[:, ys, xs]                            # 仅统计仍在前景内的帧
+        # CoWTracker 轨迹坐标为 (x, y)；按每帧轨迹位置查询前景 mask。
+        finite = np.isfinite(out_tracks).all(axis=-1)
+        px = np.rint(np.where(finite, out_tracks[..., 0], 0)).astype(np.int64)
+        py = np.rint(np.where(finite, out_tracks[..., 1], 0)).astype(np.int64)
+        inside = finite & (px >= 0) & (px < W) & (py >= 0) & (py < H)
+        foreground = np.zeros_like(out_vis, dtype=bool)
+        ti, ni = np.nonzero(inside)
+        foreground[ti, ni] = M[ti, py[ti, ni], px[ti, ni]]
+        out_vis &= foreground
     return out_tracks, out_vis
 
 
