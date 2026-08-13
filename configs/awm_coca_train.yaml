@@ -85,6 +85,9 @@ reward:
   max_frames: 29
   segmentation_prompt: robot arm
   confidence: 0.1
+  # 一个 task 中有效 seed 数的下限；低于此值则忽略整个 task（不训练、推进 sampler）。
+  # group_size=16 时设 8（要求 ≥50% 有效）。须 ≥2（leave-one-out advantage 下限）。
+  min_valid_seeds_per_group: 8
   # 训练保持三项等权；评估配置中的 0.2/0.1/0.7 是另一套实验假设，校准前不采用。
   action_metric_weights:
     mean_iou: 0.1

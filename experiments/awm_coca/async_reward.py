@@ -72,8 +72,8 @@ class AsyncRewardRunner:
             if result.sample_id in sample_ids:
                 raise ValueError(f"duplicate reward sample id: {result.sample_id}")
             sample_ids.add(result.sample_id)
-            if result.reward.get("total_reward") is None or not result.reward.get("valid", True):
-                raise ValueError(f"invalid reward for {result.sample_id}: {result.reward.get('error')}")
+            # 单个 seed 的奖励可能无效（如 SAM3 在生成帧上分割不出目标、跟踪退化）；
+            # 不在此抛错 —— 由调用方把无效 seed 标记并跳过该 seed / 整个 task。
         return sorted(results, key=lambda item: item.seed)
 
     def close(self) -> None:

@@ -70,6 +70,7 @@ class AWMCoCATrainer:
         *,
         group_id: str,
         generator: torch.Generator | None = None,
+        normalization_count: int | None = None,
     ) -> dict[str, Any]:
         if not group_id or group_id in self._consumed_groups:
             raise ValueError(f"rollout group is missing or already consumed: {group_id!r}")
@@ -81,7 +82,15 @@ class AWMCoCATrainer:
             raise ValueError("fresh rollout group must not be empty")
         records = []
         detached_loss = 0.0
-        group_size = len(fresh_rollouts)
+        local_count = len(fresh_rollouts)
+        if normalization_count is not None:
+            # 有效样本数是跨卡全局统计（leave-one-out advantage 也基于全局有效集）。
+            # 为保证各卡样本最终权重一致（1/global_valid），本地缩放需乘 world_size，
+            # 与下方 all_reduce SUM 后 /world_size 抵消。
+            world_size = dist.get_world_size() if dist.is_available() and dist.is_initialized() else 1
+            scale = float(world_size) / float(normalization_count)
+        else:
+            scale = 1.0 / local_count
         for sample in fresh_rollouts:
             sample_loss, record = awm_coca_sample_loss(
                 self.adapter, sample, self.proposal_config, beta=self.config.beta, generator=generator
@@ -89,9 +98,9 @@ class AWMCoCATrainer:
             if not torch.isfinite(sample_loss):
                 self.optimizer.zero_grad(set_to_none=True)
                 raise FloatingPointError(f"non-finite AWM-CoCA loss: {sample_loss.detach().item()}")
-            scaled_loss = sample_loss / (group_size * self.config.gradient_accumulation_steps)
+            scaled_loss = sample_loss * scale / self.config.gradient_accumulation_steps
             scaled_loss.backward()
-            detached_loss += float(sample_loss.detach().item()) / group_size
+            detached_loss += float(sample_loss.detach().item()) / local_count
             records.append(record)
         self.accumulation_step += 1
         self._consumed_groups.add(group_id)

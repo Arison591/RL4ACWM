@@ -55,6 +55,8 @@ def load_fresh_rollout_group(
     rewards, payloads = [], []
     for directory in directories:
         reward = json.loads((directory / "reward.json").read_text(encoding="utf-8"))
+        if reward.get("total_reward") is None or not reward.get("valid", True):
+            continue  # 该 seed 奖励无效（SAM3/跟踪失败等），训练时跳过该 seed
         credit = json.loads((directory / "credit.json").read_text(encoding="utf-8"))
         seed_meta = json.loads((directory / "rollout.json").read_text(encoding="utf-8"))
         if seed_meta.get("condition_id") != condition_id or int(seed_meta.get("policy_version", -1)) != policy_version:
@@ -63,8 +65,6 @@ def load_fresh_rollout_group(
         if int(chunks) != 1:
             raise ValueError(f"AWM-CoCA V2 supports exactly one rollout chunk, got {chunks}")
         total_reward = reward.get("total_reward")
-        if total_reward is None:
-            raise ValueError(f"invalid reward in {directory}")
         rewards.append(float(total_reward))
         seed = int(seed_meta["seed"])
         if artifacts is not None:

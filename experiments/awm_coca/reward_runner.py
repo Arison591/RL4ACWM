@@ -81,22 +81,30 @@ def _fdce_metrics(
         )
         if meta["init_failure"]:
             continue
-        result = metrics_fdce.foreground_displacement_chamfer_error(
-            bundle["generated_tracks"], bundle["reference_tracks"],
-            bundle["generated_visibility"], bundle["reference_visibility"],
-            visibility_threshold=visibility_threshold,
-            min_visible_fraction=min_visible_fraction,
-            min_common_frames=min_common_frames,
-            return_details=True,
-        )
-        results.append(result.score)
-        pred_tracks, pred_visibility = fdce_tracks.sample_tracks(
-            dense_pred, masks[1], k=k, seed=fdce_seed,
-        )
-        with np.errstate(all="ignore"):
-            centroid = np.nanmean(
-                np.where(pred_visibility[:, :, None], pred_tracks, np.nan), axis=1
+        try:
+            result = metrics_fdce.foreground_displacement_chamfer_error(
+                bundle["generated_tracks"], bundle["reference_tracks"],
+                bundle["generated_visibility"], bundle["reference_visibility"],
+                visibility_threshold=visibility_threshold,
+                min_visible_fraction=min_visible_fraction,
+                min_common_frames=min_common_frames,
+                return_details=True,
             )
+        except (ValueError, FloatingPointError):
+            # 单条 rollout 跟踪退化（如生成视频里机械臂不可见，轨迹被可见性过滤掉）
+            # 不应让整个 reward / 训练崩溃；跳过该 arm（与 init_failure 同语义）。
+            continue
+        results.append(result.score)
+        try:
+            pred_tracks, pred_visibility = fdce_tracks.sample_tracks(
+                dense_pred, masks[1], k=k, seed=fdce_seed,
+            )
+            with np.errstate(all="ignore"):
+                centroid = np.nanmean(
+                    np.where(pred_visibility[:, :, None], pred_tracks, np.nan), axis=1
+                )
+        except (ValueError, FloatingPointError):
+            continue
         af_results.append(action_following_metrics(centroid, command[arm], diag=diag))
     return {
         "fdce": _finite_mean(results),

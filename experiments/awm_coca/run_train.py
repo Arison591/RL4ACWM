@@ -310,6 +310,15 @@ def _score_group(
     for result in results:
         seed_dir = group_dir / result.sample_id
         (seed_dir / "reward.json").write_text(json.dumps(result.reward, ensure_ascii=False, indent=2), encoding="utf-8")
+        total_reward = result.reward.get("total_reward")
+        if total_reward is None or not result.reward.get("valid", True):
+            # SAM3/跟踪失败等导致该 seed 奖励无效：保留 reward.json，不计算 credit，
+            # 训练阶段会过滤掉该 seed（无效 seed < 足够数量时跳过整个 task）。
+            (seed_dir / "credit.json").write_text(json.dumps(
+                {"valid": False, "noise_rows": [], "error": result.reward.get("error")},
+                ensure_ascii=False, indent=2,
+            ), encoding="utf-8")
+            continue
         if artifacts is not None:
             artifact = artifacts.get(result.seed)
             if artifact is None:
@@ -321,7 +330,7 @@ def _score_group(
             except TypeError:
                 trajectory = torch.load(seed_dir / "trajectory.pt", map_location="cpu")
         credit = compute_credit(
-            trajectory, float(result.reward["total_reward"]),
+            trajectory, float(total_reward),
             window_size=int(config["proposal"].get("coca_window_size", 3)),
             num_training_noise_levels=levels,
             temperature=float(config["proposal"].get("temperature", 1.0)),
@@ -412,6 +421,8 @@ def _reward_pairs(group_dir: Path) -> list[tuple[int, float]]:
     for seed_dir in sorted(path for path in group_dir.iterdir() if path.is_dir() and path.name.startswith("seed_")):
         rollout = json.loads((seed_dir / "rollout.json").read_text(encoding="utf-8"))
         reward = json.loads((seed_dir / "reward.json").read_text(encoding="utf-8"))
+        if reward.get("total_reward") is None or not reward.get("valid", True):
+            continue  # 该 seed 奖励无效（跟踪失败等），训练时跳过
         pairs.append((int(rollout["seed"]), float(reward["total_reward"])))
     return pairs
 
@@ -607,9 +618,38 @@ def train(config: dict[str, Any], *, resume: str | None = None, device: str = "c
                 ordered_rewards = sorted(
                     (item for rows in gathered_rewards for item in rows), key=lambda item: item[0]
                 )
-                if [seed for seed, _ in ordered_rewards] != all_seeds:
+                valid_seeds = [seed for seed, _ in ordered_rewards]
+                if len(valid_seeds) != len(set(valid_seeds)) or not all(seed in all_seeds for seed in valid_seeds):
                     raise RuntimeError("distributed rollout seed gather is incomplete or duplicated")
                 global_rewards = [reward for _, reward in ordered_rewards]
+                min_valid_seeds = max(2, int(config["reward"].get("min_valid_seeds_per_group", 8)))
+                if len(valid_seeds) < min_valid_seeds:
+                    # 有效（跟踪成功）seed 数低于阈值：跳过该 task，不进训练，
+                    # 推进 sampler 处理下一个 condition。
+                    if rank == 0:
+                        progress.write(
+                            f"[WARN] skip task {raw.condition_id}: only {len(valid_seeds)}/{global_group_size} "
+                            f"seeds valid (need >= {min_valid_seeds})"
+                        )
+                    if logger is not None:
+                        logger.write({
+                            "condition_id": raw.condition_id, "group_id": global_group_id,
+                            "optimizer_step": trainer.optimizer_step, "policy_version": version,
+                            "optimizer_stepped": False, "skipped": True,
+                            "valid_seeds": len(valid_seeds), "group_size": global_group_size,
+                        })
+                    group_counter += 1
+                    if world_size > 1:
+                        dist.barrier()
+                    retention = config.get("storage", {}).get("rollout_retention")
+                    if retention is None:
+                        keep_legacy = bool(config.get("storage", {}).get("keep_consumed_rollouts", True))
+                        retention = "all" if keep_legacy else "none"
+                    _retain_consumed_group(group_dir, output, str(retention))
+                    del prepared, artifacts, artifacts_by_seed
+                    if trainer.optimizer_step >= max_steps:
+                        break
+                    continue
                 _, samples = load_fresh_rollout_group(
                     group_dir, device=runtime.device, expected_group_size=local_group_size,
                     expected_policy_version=version,
@@ -622,7 +662,9 @@ def train(config: dict[str, Any], *, resume: str | None = None, device: str = "c
                         condition=f"{condition_position}/{conditions_per_epoch}",
                         stage="update",
                     )
-                local_metrics = trainer.update_group(samples, group_id=global_group_id)
+                local_metrics = trainer.update_group(
+                    samples, group_id=global_group_id, normalization_count=len(valid_seeds)
+                )
                 metrics = _global_group_metrics(_gather_per_rank(local_metrics))
                 reward_values = [
                     float(row["reward"]["total_reward"])
