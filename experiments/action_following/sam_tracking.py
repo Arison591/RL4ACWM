@@ -16,6 +16,8 @@ from __future__ import annotations
 
 import os
 import sys
+from contextlib import contextmanager
+from threading import Lock
 
 import numpy as np
 import torch
@@ -29,6 +31,30 @@ SAM3_SRC = f"{_THIRD_PARTY}/sam3"
 SAM3_CKPT = f"{_PROJECT_ROOT}/checkpoints/sam3.pt"
 
 _sam3_video = None
+_sam3_lock = Lock()
+
+
+@contextmanager
+def _rank_local_sam3_environment():
+    """Hide the trainer process group while constructing rank-local SAM3.
+
+    SAM3 snapshots ``RANK``/``WORLD_SIZE`` in several constructors (and one
+    import-time constant).  Changing model attributes only after construction
+    is therefore too late for all internal sizing decisions.  Reward inference
+    is deliberately local to each trainer rank, so construct it as rank 0 of a
+    private world of size 1, then restore torchrun's environment unchanged.
+    """
+    overrides = {"RANK": "0", "WORLD_SIZE": "1"}
+    previous = {key: os.environ.get(key) for key in overrides}
+    os.environ.update(overrides)
+    try:
+        yield
+    finally:
+        for key, value in previous.items():
+            if value is None:
+                os.environ.pop(key, None)
+            else:
+                os.environ[key] = value
 
 
 def _force_rank_local_inference(model):
@@ -49,6 +75,8 @@ def _force_rank_local_inference(model):
     model.world_size = 1
     detector.rank = 0
     detector.world_size = 1
+    if hasattr(model, "_dist_pg_cpu"):
+        model._dist_pg_cpu = None
     return model
 
 
@@ -57,16 +85,19 @@ def get_sam3_video_model():
     global _sam3_video
     if _sam3_video is not None:
         return _sam3_video
+    with _sam3_lock:
+        if _sam3_video is not None:
+            return _sam3_video
+        device = "cuda" if torch.cuda.is_available() else "cpu"
+        with _rank_local_sam3_environment():
+            sys.path.insert(0, SAM3_SRC)
+            from sam3.model_builder import build_sam3_video_model
 
-    sys.path.insert(0, SAM3_SRC)
-    from sam3.model_builder import build_sam3_video_model
-
-    device = "cuda" if torch.cuda.is_available() else "cpu"
-    _sam3_video = build_sam3_video_model(
-        device=device, checkpoint_path=SAM3_CKPT, load_from_HF=False
-    )
-    _force_rank_local_inference(_sam3_video)
-    _sam3_video.eval()
+            _sam3_video = build_sam3_video_model(
+                device=device, checkpoint_path=SAM3_CKPT, load_from_HF=False
+            )
+        _force_rank_local_inference(_sam3_video)
+        _sam3_video.eval()
     return _sam3_video
 
 

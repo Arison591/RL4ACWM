@@ -10,6 +10,24 @@ from experiments.awm_coca.ema import ParameterEMA
 from experiments.awm_coca.training_core import ProposalConfig, RolloutTrainingSample, awm_coca_sample_loss
 
 
+def _synchronize_gradients(parameters: Sequence[torch.nn.Parameter]) -> None:
+    """Average every trainable gradient in an identical collective order.
+
+    A conditional path can leave a parameter unused on one rank.  Skipping its
+    collective only on that rank makes the remaining NCCL calls mismatch and
+    eventually time out.  A missing local gradient is a zero contribution, so
+    materialize it before the all-reduce.
+    """
+    if not (dist.is_available() and dist.is_initialized()):
+        return
+    world_size = dist.get_world_size()
+    for parameter in parameters:
+        if parameter.grad is None:
+            parameter.grad = torch.zeros_like(parameter)
+        dist.all_reduce(parameter.grad, op=dist.ReduceOp.SUM)
+        parameter.grad.div_(world_size)
+
+
 @dataclass(frozen=True)
 class OptimizerConfig:
     learning_rate: float = 1e-6
@@ -107,13 +125,7 @@ class AWMCoCATrainer:
         stepped = self.accumulation_step == self.config.gradient_accumulation_steps
         grad_norm = None
         if stepped:
-            if dist.is_available() and dist.is_initialized():
-                world_size = dist.get_world_size()
-                for parameter in self.parameters:
-                    if parameter.grad is None:
-                        continue
-                    dist.all_reduce(parameter.grad, op=dist.ReduceOp.SUM)
-                    parameter.grad.div_(world_size)
+            _synchronize_gradients(self.parameters)
             grad_norm_tensor = torch.nn.utils.clip_grad_norm_(self.parameters, self.config.max_grad_norm)
             if not torch.isfinite(grad_norm_tensor):
                 self.optimizer.zero_grad(set_to_none=True)

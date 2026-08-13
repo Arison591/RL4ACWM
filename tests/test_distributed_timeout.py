@@ -2,7 +2,13 @@ from datetime import timedelta
 
 import pytest
 
-from experiments.awm_coca.run_train import _distributed_timeout, _group_skip_reason
+from experiments.awm_coca.condition_sampler import ResumableConditionSampler
+from experiments.awm_coca.run_train import (
+    _assert_group_alignment,
+    _distributed_timeout,
+    _group_skip_reason,
+    _sampler_state_after_groups,
+)
 
 
 def test_distributed_timeout_defaults_to_two_hours(monkeypatch):
@@ -51,3 +57,24 @@ def test_group_skips_when_global_valid_count_is_below_threshold():
     assert _group_skip_reason(gathered, min_valid_seeds=8) == (
         "only 4 valid seeds (need >= 8)"
     )
+
+
+def test_checkpoint_sampler_state_ignores_prefetched_position():
+    sampler = ResumableConditionSampler(203, seed=42)
+    sampler.epoch = 9
+    sampler.position = 120  # DataLoader may have prefetched far ahead.
+
+    state = _sampler_state_after_groups(sampler, 417)
+
+    assert state["epoch"] == 2
+    assert state["position"] == 11
+
+
+def test_group_alignment_rejects_different_conditions(monkeypatch):
+    monkeypatch.setattr(
+        "experiments.awm_coca.run_train._gather_per_rank",
+        lambda value: [value, ("different", value[1], value[2])],
+    )
+
+    with pytest.raises(RuntimeError, match="alignment mismatch"):
+        _assert_group_alignment("condition", 3, 9)

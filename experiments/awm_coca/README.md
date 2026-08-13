@@ -318,6 +318,8 @@ sampler 和随机数状态。`fresh_on_policy=true` 被强制执行：每个 gro
 - `reward.workers`：建议保持每卡 1。SAM3 和 CoWTracker 是 GPU singleton，不适合线程并发。
 - `DIST_TIMEOUT_SECONDS`：不同 rank 的 rollout/reward 耗时可能相差较大；远端脚本默认
   7200 秒，避免先完成的 rank 在汇总点被 PyTorch 默认 10 分钟 NCCL 超时误杀。
+- 远端脚本启用 NCCL flight recorder；若仍发生 collective timeout，控制台日志会包含
+  更完整的 collective 次序，便于区分某卡异常退出与真正的通信问题。
 - `dataset.num_workers`：每个 rank 的 worker 数；四卡默认合计 16 个。
 - `max_optimizer_steps`、checkpoint 间隔和 rollout 保留策略只控制运行长度、恢复粒度和磁盘。
 
@@ -331,9 +333,17 @@ sampler 和随机数状态。`fresh_on_policy=true` 被强制执行：每个 gro
 - 使用相同 condition 和 policy version，按 rank 分配不重复 seed；
 - 汇总全局 16 条 reward 后计算 leave-one-out advantage；
 - optimizer step 前对 LoRA 梯度求和并除以 world size；
+- 即使某卡某个 LoRA 参数没有本地梯度，也用零梯度参加同序 all-reduce，避免 collective 错位；
 - 初始化或 resume 后由 rank 0 广播 LoRA 参数；
 - 只由 rank 0 写总指标和 checkpoint；
 - 每个 rank 独立写入和清理临时 rollout group。
+
+SAM3 在构造和推理阶段都被隔离为每卡独立的 `rank=0, world_size=1`，不会把 reward
+线程误接入训练 NCCL process group。每个 group 在 rollout 前还会核对四卡的 condition、
+policy version 和 group counter；任一项不一致就立即报错，不会继续训练错配数据。
+
+Checkpoint 保存的是按已完成 group 数推导出的精确 sampler 位置，不采用 DataLoader
+预取后可能超前的内部 position；跳过无效 task 后断点恢复也不会复用 seed 或跳错 condition。
 
 不要启动四个独立的 `train` 命令，否则会得到四个彼此分叉的 policy。
 
@@ -346,8 +356,9 @@ CUDA_VISIBLE_DEVICES=0,1,2,3 scripts/run_awm_coca.sh train4 \
   --rollout-retention videos
 ```
 
-当前开发机只有一张 A100，无法做真实四卡 NCCL 压测；分布式 reward 聚合、指标聚合和
-梯度同步已经使用独立双进程测试验证。
+当前开发机只有一张 A100，无法做真实四卡 NCCL 压测；分布式元数据聚合和含缺失本地
+梯度的同步路径已经使用独立四进程 Gloo 测试验证。目标机仍应先执行一次 4 卡 1-step
+冒烟训练，再启动 1000-step 正式训练。
 
 ## 磁盘和 checkpoint
 

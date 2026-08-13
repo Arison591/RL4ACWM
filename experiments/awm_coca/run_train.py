@@ -420,6 +420,28 @@ def _gather_per_rank(value: Any) -> list[Any]:
     return gathered
 
 
+def _assert_group_alignment(condition_id: str, policy_version: int, group_counter: int) -> None:
+    """Fail early if ranks are about to train different logical groups."""
+    local = (str(condition_id), int(policy_version), int(group_counter))
+    gathered = _gather_per_rank(local)
+    if any(item != gathered[0] for item in gathered[1:]):
+        raise RuntimeError(f"distributed group alignment mismatch: {gathered}")
+
+
+def _sampler_state_after_groups(
+    sampler: ResumableConditionSampler, completed_groups: int
+) -> dict[str, Any]:
+    """Return the exact next-condition state, independent of loader prefetch."""
+    if completed_groups < 0:
+        raise ValueError("completed_groups must be non-negative")
+    per_epoch = len(sampler)
+    epoch, position = divmod(int(completed_groups), per_epoch)
+    state = sampler.state_dict()
+    state["epoch"] = epoch
+    state["position"] = position
+    return state
+
+
 def _reward_pairs(group_dir: Path) -> list[tuple[int, float]]:
     pairs = []
     for seed_dir in sorted(path for path in group_dir.iterdir() if path.is_dir() and path.name.startswith("seed_")):
@@ -500,6 +522,12 @@ def train(config: dict[str, Any], *, resume: str | None = None, device: str = "c
             "each rank needs at least two local rollouts; increase rollout.group_size "
             f"to at least {2 * world_size}"
         )
+    rollout_batch_size = int(config["rollout"].get("rollout_batch_size", 1))
+    if rollout_batch_size <= 0 or local_group_size % rollout_batch_size:
+        raise ValueError(
+            f"rollout_batch_size={rollout_batch_size} must divide per-rank group size "
+            f"{local_group_size} (global={global_group_size}, world_size={world_size})"
+        )
     manifest, sampler = preflight(config, write_outputs=rank == 0)
     if world_size > 1:
         dist.barrier()
@@ -538,6 +566,7 @@ def train(config: dict[str, Any], *, resume: str | None = None, device: str = "c
             warmup_steps=int(optimizer_config["warmup_steps"]),
         ), ema=ema,
     )
+    restored_group_counter: int | None = None
     if resume:
         checkpoint = load_checkpoint(resume, map_location="cpu")
         _restore_adapter(runtime.transformer, checkpoint["path"])
@@ -549,6 +578,8 @@ def train(config: dict[str, Any], *, resume: str | None = None, device: str = "c
         sampler.load_state_dict(checkpoint["sampler"])
         restore_rng_state(checkpoint["rng"])
         runtime.set_policy_version(trainer.policy_version)
+        if "group_counter" in checkpoint["trainer_state"]:
+            restored_group_counter = int(checkpoint["trainer_state"]["group_counter"])
     if world_size > 1:
         for parameter in runtime.transformer.parameters():
             if parameter.requires_grad:
@@ -563,7 +594,9 @@ def train(config: dict[str, Any], *, resume: str | None = None, device: str = "c
     estimated_total_epochs = max_steps * accumulation_steps / conditions_per_epoch
     base_seed = int(config.get("seed", 42))
     group_counter = (
-        trainer.optimizer_step * int(optimizer_config["gradient_accumulation_steps"])
+        restored_group_counter
+        if restored_group_counter is not None
+        else trainer.optimizer_step * int(optimizer_config["gradient_accumulation_steps"])
         + trainer.accumulation_step
     )
     progress = tqdm(
@@ -614,6 +647,7 @@ def train(config: dict[str, Any], *, resume: str | None = None, device: str = "c
                     )
                 version = trainer.policy_version
                 runtime.set_policy_version(version)
+                _assert_group_alignment(raw.condition_id, version, group_counter)
                 prepared = runtime.prepare_condition(raw)
                 first_seed = base_seed + group_counter * global_group_size
                 global_group_id = f"{raw.condition_id}_policy_{version:08d}_seed_{first_seed}"
@@ -622,7 +656,7 @@ def train(config: dict[str, Any], *, resume: str | None = None, device: str = "c
                 group_dir, artifacts = runtime.rollout_group(
                     prepared, seeds=local_seeds, output_dir=output,
                     expected_group_size=local_group_size,
-                    rollout_batch_size=int(config["rollout"].get("rollout_batch_size", 1)),
+                    rollout_batch_size=rollout_batch_size,
                 )
                 if rank == 0:
                     progress.set_postfix(
@@ -749,8 +783,8 @@ def train(config: dict[str, Any], *, resume: str | None = None, device: str = "c
                                 optimizer=trainer.optimizer,
                                 lr_scheduler=trainer.lr_scheduler,
                                 ema_state={} if ema is None else ema.state_dict(),
-                                sampler_state=sampler.state_dict(),
-                                trainer_state=trainer.state_dict(),
+                                sampler_state=_sampler_state_after_groups(sampler, group_counter),
+                                trainer_state={**trainer.state_dict(), "group_counter": group_counter},
                                 config=config,
                             ),
                         )
