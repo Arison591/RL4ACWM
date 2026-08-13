@@ -57,32 +57,66 @@ def compute_credit(
     window_size: int = 3,
     num_training_noise_levels: int = 4,
     temperature: float = 1.0,
+    credit_source: str = "predicted_x0",
 ) -> dict[str, Any]:
     """Compute post-hoc reverse-step and training-bin credit.
 
     The output is diagnostic only; it does not sample a training noise level or
     perform any model update.
     """
+    if credit_source not in {"predicted_x0", "raw_state"}:
+        raise ValueError(f"unknown credit source: {credit_source!r}")
     step_rows: list[dict[str, Any]] = []
-    chunk_rows = []
     for chunk_id, chunk in enumerate(trajectory.get("chunks", [])):
         if len(chunk) < 2:
             continue
         final = chunk[-1]["latents"]
-        similarities = np.asarray([_cosine(item["latents"], final) for item in chunk])
-        weights = _window_weights(similarities, window_size)
-        for local_step, weight in enumerate(weights, start=1):
-            item = chunk[local_step]
+        if credit_source == "predicted_x0":
+            items = [item for item in chunk if "denoised" in item]
+            if not items:
+                raise ValueError(
+                    "trajectory has no predicted-x0 (`denoised`) tensors; "
+                    "regenerate the rollout or explicitly use credit_source='raw_state'"
+                )
+            predicted_similarities = np.asarray(
+                [_cosine(item["denoised"], final) for item in items], dtype=np.float64
+            )
+            # 与 haoran/CoCA 对齐：all_x0=[x0_hat_1, ..., x0_hat_K, final]。
+            # 最后一项 final-vs-final 为 1，提供最后一次反向更新的终点。
+            similarities = np.concatenate(
+                [predicted_similarities, np.asarray([_cosine(final, final)], dtype=np.float64)]
+            )
+            weights = _window_weights(similarities, window_size)
+            row_similarities = similarities[:-1]
+            row_deltas = similarities[1:] - similarities[:-1]
+        else:
+            # 仅保留用于历史实验复现，不作为训练默认值。
+            items = chunk[1:]
+            similarities = np.asarray(
+                [_cosine(item["latents"], final) for item in chunk], dtype=np.float64
+            )
+            weights = _window_weights(similarities, window_size)
+            row_similarities = similarities[1:]
+            row_deltas = similarities[1:] - similarities[:-1]
+
+        if len(items) != len(weights):
+            raise ValueError(
+                f"credit source {credit_source!r} produced {len(items)} items "
+                f"but {len(weights)} weights"
+            )
+        for local_step, (item, similarity, delta, weight) in enumerate(
+            zip(items, row_similarities, row_deltas, weights), start=1
+        ):
             step_rows.append({
                 "chunk": chunk_id,
                 "step": int(item["step"]),
                 "local_step": local_step,
                 "timestep": float(item.get("timestep", 0.0)),
-                "cosine_similarity": float(similarities[local_step]),
-                "delta_similarity": float(similarities[local_step] - similarities[local_step - 1]),
+                "credit_source": credit_source,
+                "cosine_similarity": float(similarity),
+                "delta_similarity": float(delta),
                 "step_weight_raw": float(weight),
             })
-        chunk_rows.append((chunk_id, similarities, weights))
 
     if not step_rows:
         raise ValueError("trajectory contains no complete denoise chunk")
@@ -121,6 +155,7 @@ def compute_credit(
         "advantage": None if advantage is None else float(advantage),
         "num_reverse_steps": len(step_rows),
         "num_training_noise_levels": levels,
+        "credit_source": credit_source,
         "window_size": int(window_size),
         "step_weight_sum": float(sum(row["step_weight"] for row in step_rows)),
         "reward_conservation_error": float(abs(sum(row["step_reward"] for row in step_rows) - total_reward)),

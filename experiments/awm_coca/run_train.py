@@ -334,6 +334,7 @@ def _score_group(
             window_size=int(config["proposal"].get("coca_window_size", 3)),
             num_training_noise_levels=levels,
             temperature=float(config["proposal"].get("temperature", 1.0)),
+            credit_source=str(config["proposal"].get("credit_source", "predicted_x0")),
         )
         (seed_dir / "credit.json").write_text(json.dumps(credit, ensure_ascii=False, indent=2), encoding="utf-8")
 
@@ -425,6 +426,29 @@ def _reward_pairs(group_dir: Path) -> list[tuple[int, float]]:
             continue  # 该 seed 奖励无效（跟踪失败等），训练时跳过
         pairs.append((int(rollout["seed"]), float(reward["total_reward"])))
     return pairs
+
+
+def _group_skip_reason(
+    gathered_rewards: list[list[tuple[int, float]]],
+    *,
+    min_valid_seeds: int,
+) -> str | None:
+    """Return the rank-synchronous reason for skipping a rollout group.
+
+    Every rank calls this after ``all_gather_object``, so every process sees the
+    same per-rank counts and takes the same train/skip branch.  In particular,
+    a globally large enough group is still skipped when one rank has no valid
+    local sample; otherwise that rank cannot enter DDP backward while its peers
+    do, which eventually deadlocks in a collective.
+    """
+    local_valid_counts = [len(rows) for rows in gathered_rewards]
+    total_valid = sum(local_valid_counts)
+    if total_valid < min_valid_seeds:
+        return f"only {total_valid} valid seeds (need >= {min_valid_seeds})"
+    empty_ranks = [rank for rank, count in enumerate(local_valid_counts) if count == 0]
+    if empty_ranks:
+        return f"no valid seed on rank(s) {empty_ranks}"
+    return None
 
 
 def _global_group_metrics(per_rank: list[dict[str, Any]]) -> dict[str, Any]:
@@ -623,13 +647,17 @@ def train(config: dict[str, Any], *, resume: str | None = None, device: str = "c
                     raise RuntimeError("distributed rollout seed gather is incomplete or duplicated")
                 global_rewards = [reward for _, reward in ordered_rewards]
                 min_valid_seeds = max(2, int(config["reward"].get("min_valid_seeds_per_group", 8)))
-                if len(valid_seeds) < min_valid_seeds:
+                skip_reason = _group_skip_reason(
+                    gathered_rewards, min_valid_seeds=min_valid_seeds
+                )
+                if skip_reason is not None:
                     # 有效（跟踪成功）seed 数低于阈值：跳过该 task，不进训练，
-                    # 推进 sampler 处理下一个 condition。
+                    # 或任一 rank 没有本地有效样本：四卡同步跳过并推进 sampler。
+                    local_valid_counts = [len(rows) for rows in gathered_rewards]
                     if rank == 0:
                         progress.write(
-                            f"[WARN] skip task {raw.condition_id}: only {len(valid_seeds)}/{global_group_size} "
-                            f"seeds valid (need >= {min_valid_seeds})"
+                            f"[WARN] skip task {raw.condition_id}: {skip_reason}; "
+                            f"per-rank valid counts={local_valid_counts}"
                         )
                     if logger is not None:
                         logger.write({
@@ -637,6 +665,8 @@ def train(config: dict[str, Any], *, resume: str | None = None, device: str = "c
                             "optimizer_step": trainer.optimizer_step, "policy_version": version,
                             "optimizer_stepped": False, "skipped": True,
                             "valid_seeds": len(valid_seeds), "group_size": global_group_size,
+                            "valid_seeds_per_rank": local_valid_counts,
+                            "skip_reason": skip_reason,
                         })
                     group_counter += 1
                     if world_size > 1:

@@ -98,7 +98,7 @@ data/agibotworld_beta/selected_samples/samples/<condition_id>/
 2. 计算每个相机的六通道 ray map。
 3. 将 trajectory map、ray map、4 帧历史和文本条件送入 GE-Sim。
 4. 使用同一个 LoRA policy version 生成一个 group 的独立随机 seed。
-5. 每条 rollout 生成 25 帧未来视频，并记录 15 步完整 reverse latent trajectory。
+5. 每条 rollout 生成 25 帧未来视频，并记录 15 步 Flow Matching predicted-x0 与 post-step latent。
 6. 计算 Action、PSNR geometry 和 50:50 joint reward。
 7. 根据 reverse trajectory 计算 CoCA credit 和噪声 proposal。
 8. 使用全局 group reward 计算 leave-one-out advantage，逐条 rollout 反传 LoRA。
@@ -106,6 +106,9 @@ data/agibotworld_beta/selected_samples/samples/<condition_id>/
 四卡训练时，每个 rank 在自己的 GPU 上独立计算本地 rollout 的 SAM3/CoWTracker/YOLO
 奖励。SAM3 会被显式设为 rank-local 单进程推理（`world_size=1`），不会复用训练进程组
 执行其内部 `all_gather`；奖励完成后才进入训练侧的跨 rank gather/all-reduce。
+所有 rank gather 完有效 seed 数后统一决定训练或跳过：只要任一 rank 的本地有效 seed 为
+0，即使全局有效数已经达到阈值，也会四卡同步跳过该 task，避免空 rank 与其他 rank 的
+反向传播路径不一致而发生 NCCL 超时。
 
 Loader 会拒绝以下数据：
 
@@ -213,19 +216,22 @@ R_geometry = sigmoid((balanced_psnr - 20.4) / 1.8)
 
 ## CoCA credit 分配
 
-一条 rollout 有 15 步 reverse trajectory：
+一条 rollout 有 15 个 Flow Matching clean-latent prediction，并有最终 post-step latent：
 
 ```text
-z_0, z_1, ..., z_15
+x0_hat_1, x0_hat_2, ..., x0_hat_15, z_final
 ```
 
-首先计算每一步与最终 latent 的余弦相似度：
+其中 pipeline 在每步按 `x0_hat = c_skip * x_t + c_out * velocity` 得到 predicted-x0。
+Credit 使用 predicted-x0 与最终 latent 的余弦相似度，不再使用仍带噪的中间 `x_t`：
 
 ```text
-s_t = cosine(z_t, z_15)
+s_t  = cosine(x0_hat_t, z_final),  t=1..15
+s_16 = cosine(z_final, z_final) = 1
 ```
 
-默认 `coca_window_size=3`，15 步被分成 5 个连续窗口。每个窗口的贡献是当前窗口平均
+这个末尾的 1 是最后一次反向更新的明确终点。默认 `coca_window_size=3`，15 个相邻转移
+被分成 5 个连续窗口。每个窗口的贡献是当前窗口平均
 相似度相对于上一个参考相似度的变化。窗口内各 reverse step 获得相同原始贡献，随后
 将全部 15 个 step weight 归一化到和为 1。
 
@@ -289,6 +295,7 @@ sampler 和随机数状态。`fresh_on_policy=true` 被强制执行：每个 gro
   因而四卡最小为 8。它影响 baseline 方差和 rollout 成本，不是 transformer batch size。
 - `rollout.reverse_denoise_steps`：默认 15，必须与 GE-Sim 配置一致，不能单独修改。
 - `proposal.coca_window_size`：越大越平滑，但 reverse-step 定位会变粗。
+- `proposal.credit_source`：正式训练固定为 `predicted_x0`；`raw_state` 只用于旧版消融。
 - `proposal.num_training_noise_levels`：噪声档位数；必须与基础概率列表长度一致。
 - `proposal.eta`：越高越依赖 CoCA；不稳定时可先从 0.9 降到 0.5～0.7。
 - `proposal.temperature`：越低 proposal 越尖锐，越高越接近均匀。

@@ -238,10 +238,16 @@ class PersistentGeSimRuntime:
 
         def on_end(_pipe: Any, index: int, timestep: torch.Tensor, values: dict[str, torch.Tensor]) -> dict[str, torch.Tensor]:
             latents = values["latents"]
+            denoised = values["denoised"]
             for b in range(batch):
                 trajectories[b].append({
                     "step": index + 1, "timestep": float(timestep.item()),
                     "latents": latents[b * views:(b + 1) * views].detach().cpu(),
+                    # Flow Matching clean-latent estimate x0_hat for this reverse
+                    # step.  CoCA compares these predictions with the final
+                    # post-step latent; the noisy/post-step `latents` are not the
+                    # credit signal.
+                    "denoised": denoised[b * views:(b + 1) * views].detach().cpu(),
                 })
             return values
 
@@ -257,6 +263,7 @@ class PersistentGeSimRuntime:
             generator=generators,
             conditioning_latents=memory,
             callback_on_step_start=on_start, callback_on_step_end=on_end,
+            callback_on_step_end_tensor_inputs=["latents", "denoised"],
             output_type="pt", postprocess_video=False,
         )["frames"]
         for trajectory in trajectories:

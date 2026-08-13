@@ -224,7 +224,8 @@ def main() -> None:
             item["reward"]["advantage"] = advantage
             credit = compute_credit(item["trajectory"], reward_value, advantage=advantage,
                                     window_size=window_size, num_training_noise_levels=noise_levels,
-                                    temperature=temperature)
+                                    temperature=temperature,
+                                    credit_source=str(coca_config.get("credit_source", "predicted_x0")))
             LOGGER.info(
                 "[%s/seed_%s] credit 完成: reverse_steps=%d, noise_levels=%d, "
                 "reward_conservation_error=%.3e",

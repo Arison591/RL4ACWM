@@ -46,6 +46,9 @@ proposal:
   eta: 0.9
   temperature: 1.0
   coca_window_size: 3
+  # CoCA credit 使用每一步 Flow Matching 的 predicted-x0 与最终 latent 的相似度。
+  # raw_state 仅用于复现旧版“中间 noisy latent 对 final”的消融实验。
+  credit_source: predicted_x0
   # 可选的 p(k)/q(k) 上限；null 表示保持无偏 importance ratio。
   importance_clipping: null
 

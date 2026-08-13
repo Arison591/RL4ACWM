@@ -36,6 +36,8 @@ geometry:
   placeholder: true
 
 coca:
+  # 使用每一步 Flow Matching predicted-x0 与最终 latent 的相似度分配 credit。
+  credit_source: predicted_x0
   # Cosmos config uses K=15 reverse denoise steps; 3 gives 5 equal windows.
   window_size: 3
   # AWM reference implementation uses four discrete training levels.
