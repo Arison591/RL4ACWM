@@ -100,7 +100,9 @@ def build_proposal(
     if not torch.isfinite(scores).all():
         raise ValueError("noise_scores must be finite")
     base = base_distribution(config, device=device)
-    coca = torch.softmax(scores / config.temperature, dim=0)
+    # CoCA proposal 直接用原始 credit 权重，不做 softmax（采样正比于 credit）。
+    # credit 各 level 之和为 1，本身就是合法分布；实测恒非负，直接作采样权重。
+    coca = scores
     proposal = (1.0 - config.eta) * base + config.eta * coca
     return base, coca, proposal
 

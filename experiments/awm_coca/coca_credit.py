@@ -101,9 +101,10 @@ def compute_credit(
         row["noise_level"] = int(bin_id + 1)
         bins[bin_id].append(index)
     noise_scores = np.asarray([raw[idxs].sum() for idxs in bins], dtype=np.float64)
-    # Use the CoCA proposal directly as q(k). AWM's original p(k) is not
-    # mixed in during this evaluation-only phase.
-    q = _softmax(noise_scores, temperature)
+    # 与训练侧 CoCA 采样一致：q 直接用原始 credit，不做 softmax。
+    # credit 本身已归一化（各 level 之和=1）；softmax 会二次归一化并压平差异。
+    # 此处不混入 AWM 的均匀 base（evaluation-only）。
+    q = noise_scores
     noise_rows = []
     for level, idxs in enumerate(bins, start=1):
         noise_rows.append({

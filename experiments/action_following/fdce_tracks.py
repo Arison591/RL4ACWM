@@ -123,7 +123,12 @@ def sample_tracks(dense, mask, anchors=None, *, k: int = 16, seed: int = 0):
             raise ValueError(f"mask 需为 ({T},{H},{W}) bool，收到 {M.shape}")
         if M.shape[0] != T:
             M = M[_align_index(M.shape[0], T)]             # 对齐到 dense 帧数
-        out_vis &= M[:, ys, xs]                            # 仅统计仍在前景内的帧
+        # 用该点"当前轨迹位置"查询前景 mask，而非固定锚点初始像素位置：
+        # 否则机械臂移动后锚点初始位置离开前景，会被误判为不可见。
+        coords = np.nan_to_num(out_tracks, nan=0.0)        # NaN 由 dense_vis 处理，这里安全置 0
+        coords = np.clip(np.round(coords).astype(np.int64), 0, (W - 1, H - 1))
+        cy, cx = coords[..., 1], coords[..., 0]
+        out_vis &= M[np.arange(T)[:, None], cy, cx]
     return out_tracks, out_vis
 
 
