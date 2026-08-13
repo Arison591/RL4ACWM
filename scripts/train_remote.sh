@@ -246,7 +246,7 @@ PYTHON_BIN="${PYTHON_BIN}" "${SCRIPT_DIR}/run_awm_coca.sh" preflight "${COMMON_A
   --config "${REPO_ROOT}/configs/awm_coca_train.yaml" \
   --print-effective-config \
   --effective-config-output "${EFFECTIVE_CONFIG}" \
-  "${COMMON_ARGS[@]}"
+  "${COMMON_ARGS[@]}" "$@"
 
 echo "[INFO] 单机四卡训练开始：global group=16，每卡 4 条 rollout"
 PYTHON_BIN="${PYTHON_BIN}" NPROC_PER_NODE="${NPROC_PER_NODE}" \
