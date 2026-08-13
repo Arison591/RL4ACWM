@@ -242,6 +242,9 @@ CUDA_VISIBLE_DEVICES=0 scripts/run_awm_coca.sh preflight \
 bash scripts/train_remote.sh
 ```
 
+目标机若存在 `/hpc2hdd/home/bohantan/jhupload/hr_data/awm_coca_models`，脚本会自动将其
+作为模型目录；不存在时才回退到仓库的 `checkpoints/`。也可通过 `MODEL_DIR` 显式覆盖。
+
 指定三个主要目录时：
 
 ```bash

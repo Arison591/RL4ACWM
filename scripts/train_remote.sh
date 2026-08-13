@@ -8,7 +8,15 @@ REPO_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
 # 目标训练机的数据盘与 workspace 分离，因此优先检查 hr_data；其他机器仍回退到仓库 dataset/。
 DATA_DIR="${DATA_DIR:-}"
 REMOTE_DATA_DIR="${REMOTE_DATA_DIR:-/hpc2hdd/home/bohantan/jhupload/hr_data}"
-MODEL_DIR="${MODEL_DIR:-${REPO_ROOT}/checkpoints}"
+# 目标机模型默认放在外部数据盘；其他机器仍回退到仓库 checkpoints/。
+# MODEL_DIR 始终拥有最高优先级，便于迁移到任意机器。
+if [[ -n "${MODEL_DIR:-}" ]]; then
+  MODEL_DIR="${MODEL_DIR}"
+elif [[ -d "${REMOTE_DATA_DIR}/awm_coca_models" ]]; then
+  MODEL_DIR="${REMOTE_DATA_DIR}/awm_coca_models"
+else
+  MODEL_DIR="${REPO_ROOT}/checkpoints"
+fi
 OUTPUT_DIR="${OUTPUT_DIR:-}"
 OUTPUT_DIR_WAS_SET=0
 [[ -n "${OUTPUT_DIR}" ]] && OUTPUT_DIR_WAS_SET=1
