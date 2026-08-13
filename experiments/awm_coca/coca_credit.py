@@ -72,11 +72,13 @@ def compute_credit(
             continue
         final = chunk[-1]["latents"]
         if credit_source == "predicted_x0":
-            items = [item for item in chunk if "denoised" in item]
-            if not items:
+            items = chunk[1:]
+            missing_steps = [int(item.get("step", -1)) for item in items if "denoised" not in item]
+            if missing_steps:
                 raise ValueError(
-                    "trajectory has no predicted-x0 (`denoised`) tensors; "
-                    "regenerate the rollout or explicitly use credit_source='raw_state'"
+                    "trajectory is missing predicted-x0 (`denoised`) tensors at "
+                    f"reverse step(s) {missing_steps}; regenerate the rollout or explicitly "
+                    "use credit_source='raw_state'"
                 )
             predicted_similarities = np.asarray(
                 [_cosine(item["denoised"], final) for item in items], dtype=np.float64
@@ -84,7 +86,7 @@ def compute_credit(
             # 与 haoran/CoCA 对齐：all_x0=[x0_hat_1, ..., x0_hat_K, final]。
             # 最后一项 final-vs-final 为 1，提供最后一次反向更新的终点。
             similarities = np.concatenate(
-                [predicted_similarities, np.asarray([_cosine(final, final)], dtype=np.float64)]
+                [predicted_similarities, np.asarray([1.0], dtype=np.float64)]
             )
             weights = _window_weights(similarities, window_size)
             row_similarities = similarities[:-1]
@@ -135,10 +137,10 @@ def compute_credit(
         row["noise_level"] = int(bin_id + 1)
         bins[bin_id].append(index)
     noise_scores = np.asarray([raw[idxs].sum() for idxs in bins], dtype=np.float64)
-    # 与训练侧 CoCA 采样一致：q 直接用原始 credit，不做 softmax。
-    # credit 本身已归一化（各 level 之和=1）；softmax 会二次归一化并压平差异。
-    # 此处不混入 AWM 的均匀 base（evaluation-only）。
-    q = noise_scores
+    # Window contribution can be negative whenever similarity is non-monotonic,
+    # so it is a score rather than a probability.  Match haoran/CoCA by mapping
+    # it through a temperature softmax before mixing with the base proposal.
+    q = _softmax(noise_scores, temperature)
     noise_rows = []
     for level, idxs in enumerate(bins, start=1):
         noise_rows.append({

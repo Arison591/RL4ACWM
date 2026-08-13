@@ -116,6 +116,9 @@ def apply_cli_overrides(config: dict[str, Any], args: argparse.Namespace) -> dic
             target[key] = value
     if args.smoke_test:
         updated["rollout"]["group_size"] = 2
+        # A group=2 smoke run can never satisfy the production threshold of 8;
+        # keep the leave-one-out minimum while allowing its single update to run.
+        updated["reward"]["min_valid_seeds_per_group"] = 2
         updated["max_optimizer_steps"] = 1
         updated["dataset"]["limit"] = 1
         updated["dataset"]["num_workers"] = 0

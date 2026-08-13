@@ -6,7 +6,7 @@ import torch
 from experiments.awm_coca.coca_credit import compute_credit
 
 
-def _trajectory(*, include_denoised: bool = True) -> dict:
+def _trajectory(*, include_denoised: bool = True, omit_step: int | None = None) -> dict:
     rows = [
         {"step": 0, "timestep": 1.0, "latents": torch.tensor([[9.0, 9.0]])},
         {"step": 1, "timestep": 0.8, "latents": torch.tensor([[1.0, 0.0]])},
@@ -16,6 +16,8 @@ def _trajectory(*, include_denoised: bool = True) -> dict:
     if include_denoised:
         rows[1]["denoised"] = torch.tensor([[0.0, 1.0]])
         rows[2]["denoised"] = torch.tensor([[1.0, 0.0]])
+        if omit_step is not None:
+            rows[omit_step].pop("denoised")
     return {"chunks": [rows], "num_chunks": 1}
 
 
@@ -36,5 +38,10 @@ def test_predicted_x0_credit_compares_denoised_predictions_to_final_latent():
 
 
 def test_predicted_x0_credit_rejects_legacy_trajectory_without_denoised():
-    with pytest.raises(ValueError, match="no predicted-x0"):
+    with pytest.raises(ValueError, match="missing predicted-x0"):
         compute_credit(_trajectory(include_denoised=False), 1.0)
+
+
+def test_predicted_x0_credit_rejects_partially_missing_reverse_step():
+    with pytest.raises(ValueError, match=r"step\(s\) \[1\]"):
+        compute_credit(_trajectory(omit_step=1), 1.0)

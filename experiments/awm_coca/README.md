@@ -242,7 +242,12 @@ step_reward_t = total_reward * step_weight_t
 ```
 
 其和严格等于 total reward。Step weight 可能为负数，因为 reverse trajectory 的相似度
-不保证单调；如果总贡献接近 0，则回退成均匀权重。
+不保证单调；如果总贡献接近 0，则回退成均匀权重。负的 window contribution 是 score，
+不能直接交给采样器，映射到训练 proposal 时必须经过 temperature softmax。
+
+正常训练以及从 checkpoint 断点续训都会重新生成当前 group 的 rollout，不会读取历史
+`trajectory.pt`。只有用 `run_eval.py --skip-rollout` 对已有 rollout 离线重算 credit 时，
+旧版未保存 `denoised` 的 trajectory 才需要重新生成；代码会明确报出缺失的 reverse step。
 
 15 个 reverse step 再按顺序映射到 7 个训练噪声档位。每个档位累计原始 step
 contribution 得到 `noise_score_k`：

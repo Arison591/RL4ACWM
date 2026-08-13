@@ -100,10 +100,15 @@ def build_proposal(
     if not torch.isfinite(scores).all():
         raise ValueError("noise_scores must be finite")
     base = base_distribution(config, device=device)
-    # CoCA proposal 直接用原始 credit 权重，不做 softmax（采样正比于 credit）。
-    # credit 各 level 之和为 1，本身就是合法分布；实测恒非负，直接作采样权重。
-    coca = scores
+    # CoCA window contributions are scores, not probabilities: a non-monotonic
+    # similarity trajectory can legitimately produce negative values.  The
+    # temperature softmax matches haoran/CoCA and guarantees valid sampling
+    # probabilities before mixing with the full-support base distribution.
+    coca = torch.softmax(scores / float(config.temperature), dim=0)
     proposal = (1.0 - config.eta) * base + config.eta * coca
+    if not torch.isfinite(proposal).all() or torch.any(proposal <= 0):
+        raise ValueError("CoCA proposal must be finite and strictly positive")
+    proposal = proposal / proposal.sum()
     return base, coca, proposal
 
 

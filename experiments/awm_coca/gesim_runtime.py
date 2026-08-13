@@ -269,6 +269,14 @@ class PersistentGeSimRuntime:
         for trajectory in trajectories:
             if len(trajectory) != n_steps + 1:
                 raise RuntimeError("pipeline did not expose the complete reverse trajectory")
+            missing_predicted_x0 = [
+                int(row["step"]) for row in trajectory[1:] if "denoised" not in row
+            ]
+            if missing_predicted_x0:
+                raise RuntimeError(
+                    "pipeline did not expose predicted-x0 at reverse step(s) "
+                    f"{missing_predicted_x0}"
+                )
         if prepared.memory_latents is None:
             prepared.memory_latents = captured_condition["conditioning_latents"].clone()
             prepared.prompt_embeds = captured_condition["prompt_embeds"].clone()
