@@ -305,7 +305,7 @@ sampler 和随机数状态。`fresh_on_policy=true` 被强制执行：每个 gro
 - `proposal.eta`：越高越依赖 CoCA；不稳定时可先从 0.9 降到 0.5～0.7。
 - `proposal.temperature`：越低 proposal 越尖锐，越高越接近均匀。
 - `proposal.importance_clipping`：限制 `p/q`，可减小极端方差但会引入偏差；默认关闭。
-- `optimizer.learning_rate`：默认 `1e-6`。
+- `optimizer.learning_rate`：默认 `1e-5`。
 - `optimizer.warmup_steps`：默认 100，控制训练初期步长。
 - `optimizer.reference_kl_beta`：默认 0.01；生成质量漂移过快时可提高。
 - `optimizer.max_grad_norm`：默认 1.0。
