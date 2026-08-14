@@ -1,0 +1,71 @@
+diff --git a/sam3/model_builder.py b/sam3/model_builder.py
+index a5dea87..1352f70 100644
+--- a/sam3/model_builder.py
++++ b/sam3/model_builder.py
+@@ -5,7 +5,7 @@
+ import os
+ from typing import Optional
+ 
+-import pkg_resources
++from importlib.resources import files
+ import torch
+ import torch.nn as nn
+ from huggingface_hub import hf_hub_download
+@@ -596,9 +596,7 @@ def build_sam3_image_model(
+         A SAM3 image model
+     """
+     if bpe_path is None:
+-        bpe_path = pkg_resources.resource_filename(
+-            "sam3", "assets/bpe_simple_vocab_16e6.txt.gz"
+-        )
++        bpe_path = str(files("sam3").joinpath("assets/bpe_simple_vocab_16e6.txt.gz"))
+ 
+     # Create visual components
+     compile_mode = "default" if compile else None
+@@ -695,9 +693,7 @@ def build_sam3_video_model(
+         Sam3VideoInferenceWithInstanceInteractivity: The instantiated dense tracking model
+     """
+     if bpe_path is None:
+-        bpe_path = pkg_resources.resource_filename(
+-            "sam3", "assets/bpe_simple_vocab_16e6.txt.gz"
+-        )
++        bpe_path = str(files("sam3").joinpath("assets/bpe_simple_vocab_16e6.txt.gz"))
+ 
+     # Build Tracker module
+     tracker = build_tracker(apply_temporal_disambiguation=apply_temporal_disambiguation)
+@@ -1105,9 +1101,7 @@ def build_sam3_multiplex_video_predictor(
+         Sam3MultiplexVideoPredictor: The fully-initialized predictor
+     """
+     if bpe_path is None:
+-        bpe_path = pkg_resources.resource_filename(
+-            "sam3", "assets/bpe_simple_vocab_16e6.txt.gz"
+-        )
++        bpe_path = str(files("sam3").joinpath("assets/bpe_simple_vocab_16e6.txt.gz"))
+ 
+     from sam3.model.sam3_multiplex_base import Sam3MultiplexPredictorWrapper
+     from sam3.model.sam3_multiplex_detector import Sam3MultiplexDetector
+diff --git a/sam3/perflib/fused.py b/sam3/perflib/fused.py
+index 6800cca..3f33fb5 100644
+--- a/sam3/perflib/fused.py
++++ b/sam3/perflib/fused.py
+@@ -12,14 +12,12 @@ def addmm_act(activation, linear, mat1):
+         raise ValueError("Expected grad to be disabled.")
+     self = linear.bias.detach()
+     mat2 = linear.weight.detach()
+-    self = self.to(torch.bfloat16)
+-    mat1 = mat1.to(torch.bfloat16)
+-    mat2 = mat2.to(torch.bfloat16)
+-    mat1_flat = mat1.view(-1, mat1.shape[-1])
+     if activation in [torch.nn.functional.relu, torch.nn.ReLU]:
+-        y = addmm_act_op(self, mat1_flat, mat2.t(), beta=1, alpha=1, use_gelu=False)
+-        return y.view(mat1.shape[:-1] + (y.shape[-1],))
++        return torch.nn.functional.relu(
++            torch.nn.functional.linear(mat1, mat2, self)
++        )
+     if activation in [torch.nn.functional.gelu, torch.nn.GELU]:
+-        y = addmm_act_op(self, mat1_flat, mat2.t(), beta=1, alpha=1, use_gelu=True)
+-        return y.view(mat1.shape[:-1] + (y.shape[-1],))
++        return torch.nn.functional.gelu(
++            torch.nn.functional.linear(mat1, mat2, self)
++        )
+     raise ValueError(f"Unexpected activation {activation}")

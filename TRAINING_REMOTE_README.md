@@ -219,9 +219,7 @@ CoWTracker 权重采用 CC-BY-NC-4.0，运行下载脚本前请确认训练用�
 6. GE-Sim 配置与 15 步 reverse denoise 设置。
 
 多卡训练中的 reward 是每个 rank 独立推理：SAM3 在本 rank 当前 GPU 上强制使用单进程
-模式；构造阶段也会屏蔽 torchrun 的 `RANK/WORLD_SIZE`，不参与训练进程组的 collective，
-避免异步 reward 与训练 all-reduce 次序冲突。每个 group 开始前会核对四卡 condition、
-policy version 和 group counter；checkpoint 使用已完成 group 数保存精确断点位置。
+模式，不参与训练进程组的 collective，避免异步 reward 与训练 all-reduce 次序冲突。
 
 也可以手动执行：
 
@@ -241,9 +239,6 @@ CUDA_VISIBLE_DEVICES=0 scripts/run_awm_coca.sh preflight \
 ```bash
 bash scripts/train_remote.sh
 ```
-
-目标机若存在 `/hpc2hdd/home/bohantan/jhupload/hr_data/awm_coca_models`，脚本会自动将其
-作为模型目录；不存在时才回退到仓库的 `checkpoints/`。也可通过 `MODEL_DIR` 显式覆盖。
 
 指定三个主要目录时：
 

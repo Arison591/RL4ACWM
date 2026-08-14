@@ -16,7 +16,7 @@
 
 
 import inspect
-from typing import Callable, Dict, List, Optional, Union
+from typing import Any, Callable, Dict, List, Optional, Union
 
 import numpy as np
 import os.path as osp
@@ -146,7 +146,7 @@ class GeSimCosmos2Pipeline(DiffusionPipeline):
     """
 
     model_cpu_offload_seq = "text_encoder->transformer->vae"
-    _callback_tensor_inputs = ["latents", "prompt_embeds", "negative_prompt_embeds"]
+    _callback_tensor_inputs = ["latents", "denoised", "prompt_embeds", "negative_prompt_embeds"]
     # We mark safety_checker as optional here to get around some test failures, but it is not really optional
     _optional_components = ["safety_checker"]
 
@@ -385,6 +385,7 @@ class GeSimCosmos2Pipeline(DiffusionPipeline):
         num_videos_per_prompt: Optional[int] = 1,
         generator: Optional[Union[torch.Generator, List[torch.Generator]]] = None,
         latents: Optional[torch.Tensor] = None,
+        conditioning_latents: Optional[torch.Tensor] = None,
         prompt_embeds: Optional[torch.Tensor] = None,
         negative_prompt_embeds: Optional[torch.Tensor] = None,
         output_type: Optional[str] = "pil",
@@ -392,6 +393,7 @@ class GeSimCosmos2Pipeline(DiffusionPipeline):
         callback_on_step_end: Optional[
             Union[Callable[[int, int, Dict], None], PipelineCallback, MultiPipelineCallbacks]
         ] = None,
+        callback_on_step_start: Optional[Callable[[Any, int, Any, Dict], Optional[Dict]]] = None,
         callback_on_step_end_tensor_inputs: List[str] = ["latents"],
         max_sequence_length: int = 512,
         sigma_conditioning: float = 0.0001,
@@ -563,6 +565,7 @@ class GeSimCosmos2Pipeline(DiffusionPipeline):
             device,
             generator,
             latents,
+            conditioning_latents,
         )  # indicator and mask here are all about memory video, action condition not included
            # latents here only contains future
         unconditioning_latents = None
@@ -586,6 +589,24 @@ class GeSimCosmos2Pipeline(DiffusionPipeline):
             for i, t in enumerate(timesteps):
                 if self.interrupt:
                     continue
+
+                if callback_on_step_start is not None:
+                    callback_outputs = callback_on_step_start(
+                        self,
+                        i,
+                        t,
+                        {
+                            "latents": latents,
+                            "conditioning_latents": conditioning_latents,
+                            "cond_indicator": cond_indicator,
+                            "cond_mask": cond_mask,
+                            "padding_mask": padding_mask,
+                            "cond_to_concat": cond_to_concat,
+                            "prompt_embeds": prompt_embeds,
+                        },
+                    )
+                    if callback_outputs is not None:
+                        latents = callback_outputs.pop("latents", latents)
 
                 self._current_timestep = t
                 current_sigma = self.scheduler.sigmas[i]
@@ -666,7 +687,11 @@ class GeSimCosmos2Pipeline(DiffusionPipeline):
                     # )
                     noise_pred = noise_pred + self.guidance_scale * (noise_pred - noise_pred_uncond)
 
-                noise_pred = (latents - noise_pred) / current_sigma
+                # `denoised` is the model's clean-latent estimate at the current
+                # noise level.  It is distinct from `latents`, which remains x_t
+                # and can look noisy when decoded early in the reverse process.
+                denoised = noise_pred
+                noise_pred = (latents - denoised) / current_sigma
                 latents = self.scheduler.step(noise_pred, t, latents, return_dict=False)[0]
 
                 if callback_on_step_end is not None:
@@ -746,6 +771,7 @@ class GeSimCosmos2Pipeline(DiffusionPipeline):
         device: Optional[torch.device] = None,
         generator: Optional[Union[torch.Generator, List[torch.Generator]]] = None,
         latents: Optional[torch.Tensor] = None,
+        conditioning_latents: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         if isinstance(generator, list) and len(generator) != batch_size:
             raise ValueError(
@@ -755,17 +781,24 @@ class GeSimCosmos2Pipeline(DiffusionPipeline):
 
         num_cond_frames = video.size(2)
         num_cond_latent_frames = num_cond_frames  # encode memory separately
-        init_latents = [retrieve_latents(self.vae.encode(video[:, :, it].unsqueeze(2)), generator) for it in range(video.size(2))]
+        if conditioning_latents is None:
+            init_latents = [
+                retrieve_latents(self.vae.encode(video[:, :, it].unsqueeze(2)), sample_mode="argmax")
+                for it in range(video.size(2))
+            ]
+            init_latents = torch.cat(init_latents, dim=2).to(dtype)
 
-        init_latents = torch.cat(init_latents, dim=2).to(dtype)
-
-        latents_mean = (
-            torch.tensor(self.vae.config.latents_mean).view(1, self.vae.config.z_dim, 1, 1, 1).to(device, dtype)
-        )
-        latents_std = (
-            torch.tensor(self.vae.config.latents_std).view(1, self.vae.config.z_dim, 1, 1, 1).to(device, dtype)
-        )
-        init_latents = (init_latents - latents_mean) / latents_std * self.scheduler.config.sigma_data  # sigma_data=1.0
+            latents_mean = (
+                torch.tensor(self.vae.config.latents_mean).view(1, self.vae.config.z_dim, 1, 1, 1).to(device, dtype)
+            )
+            latents_std = (
+                torch.tensor(self.vae.config.latents_std).view(1, self.vae.config.z_dim, 1, 1, 1).to(device, dtype)
+            )
+            init_latents = (init_latents - latents_mean) / latents_std * self.scheduler.config.sigma_data
+        else:
+            init_latents = conditioning_latents.to(device=device, dtype=dtype)
+            if init_latents.shape[0] != batch_size or init_latents.shape[2] != num_cond_latent_frames:
+                raise ValueError("precomputed conditioning_latents shape does not match video batch/history")
 
         num_latent_frames = (num_frames - 1) // self.vae_scale_factor_temporal + 1
         latent_height = height // self.vae_scale_factor_spatial
