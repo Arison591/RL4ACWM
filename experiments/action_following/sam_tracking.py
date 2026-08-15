@@ -101,15 +101,15 @@ def get_sam3_video_model():
     return _sam3_video
 
 
-def _sam3_prompt_autocast():
-    """Use the mixed-precision context required by SAM3's prompt path.
+def _sam3_inference_autocast():
+    """Use the mixed-precision context required by a full SAM3 video pass.
 
     SAM3's detector can return BF16 tracker-backbone features (in particular
     after its propagation path has been compiled), while the tracker mask
-    decoder keeps FP32 convolution parameters.  The upstream predictor wraps
-    ``model.add_prompt`` in CUDA BF16 autocast so PyTorch casts those
-    convolution parameters consistently.  This project calls the underlying
-    video model directly, so it must provide the same context itself.
+    decoder keeps FP32 convolution parameters.  Keep initialization, prompting,
+    and generator iteration in one CUDA BF16 autocast scope so every detector
+    re-entry casts those convolution parameters consistently.  This project
+    calls the underlying video model directly, so it must provide that scope.
     """
     return torch.autocast(
         device_type="cuda",
@@ -152,26 +152,27 @@ def track_masks(
     model.score_threshold_detection = float(confidence)
     model.new_det_thresh = float(confidence)
 
-    # 1. init_state：接受视频路径或 PIL 帧列表（见 sam3/model/io_utils.py）
-    inference_state = model.init_state(init_input)
+    # SAM3 re-enters its detector both in add_prompt and while advancing the
+    # propagation generator.  Keep the entire pass in one autocast scope;
+    # wrapping only add_prompt leaves propagation vulnerable to BF16 features
+    # entering FP32 mask-decoder convolutions.
+    with _sam3_inference_autocast():
+        # 1. init_state：接受视频路径或 PIL 帧列表（见 sam3/model/io_utils.py）
+        inference_state = model.init_state(init_input)
 
-    # 2. 纯文本 prompt（无首帧 mask / box；add_prompt 的 text_str 直接驱动全序列分割）
-    # Match SAM3's official predictor wrapper.  Without this context, a model
-    # reused after evaluation/propagation may feed BF16 backbone features into
-    # FP32 mask-decoder convolutions and fail before the training reward step.
-    with _sam3_prompt_autocast():
+        # 2. 纯文本 prompt（无首帧 mask / box；add_prompt 的 text_str 直接驱动全序列分割）
         model.add_prompt(inference_state, frame_idx=0, text_str=prompt)
 
-    # 3. propagate → 逐帧 mask
-    H = inference_state["orig_height"]
-    W = inference_state["orig_width"]
-    masks = np.zeros((inference_state["num_frames"], H, W), dtype=bool)
-    for frame_idx, out in model.propagate_in_video(inference_state):
-        if out is None:
-            continue
-               # propagate_in_video 产出的是后处理字典（out_obj_ids / out_binary_masks 等），
-        # 不是原始 obj_id_to_mask。out_binary_masks: (N,H,W) bool，取或合成单帧 EEF mask
-        masks[frame_idx] |= out["out_binary_masks"].any(axis=0)
+        # 3. propagate → 逐帧 mask。生成器必须在 autocast scope 内实际迭代。
+        H = inference_state["orig_height"]
+        W = inference_state["orig_width"]
+        masks = np.zeros((inference_state["num_frames"], H, W), dtype=bool)
+        for frame_idx, out in model.propagate_in_video(inference_state):
+            if out is None:
+                continue
+            # propagate_in_video 产出的是后处理字典（out_obj_ids / out_binary_masks 等），
+            # 不是原始 obj_id_to_mask。out_binary_masks: (N,H,W) bool，取或合成单帧 EEF mask
+            masks[frame_idx] |= out["out_binary_masks"].any(axis=0)
     return masks
 
 

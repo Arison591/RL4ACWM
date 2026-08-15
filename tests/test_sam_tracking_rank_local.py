@@ -41,7 +41,7 @@ def test_rank_local_environment_masks_and_restores_torchrun_values(monkeypatch) 
     assert os.environ["WORLD_SIZE"] == "4"
 
 
-def test_track_masks_wraps_add_prompt_in_sam3_bf16_autocast(monkeypatch) -> None:
+def test_track_masks_wraps_full_sam3_pass_in_bf16_autocast(monkeypatch) -> None:
     state = {"autocast": False, "entered": 0}
 
     class _Autocast:
@@ -57,6 +57,7 @@ def test_track_masks_wraps_add_prompt_in_sam3_bf16_autocast(monkeypatch) -> None
         new_det_thresh = 0.7
 
         def init_state(self, _frames):
+            assert state["autocast"] is True
             return {"orig_height": 2, "orig_width": 3, "num_frames": 1}
 
         def add_prompt(self, _inference_state, *, frame_idx, text_str):
@@ -65,10 +66,11 @@ def test_track_masks_wraps_add_prompt_in_sam3_bf16_autocast(monkeypatch) -> None
             assert state["autocast"] is True
 
         def propagate_in_video(self, _inference_state):
+            assert state["autocast"] is True
             yield 0, {"out_binary_masks": np.ones((1, 2, 3), dtype=bool)}
 
     monkeypatch.setattr(sam_tracking, "get_sam3_video_model", lambda: _VideoModel())
-    monkeypatch.setattr(sam_tracking, "_sam3_prompt_autocast", lambda: _Autocast())
+    monkeypatch.setattr(sam_tracking, "_sam3_inference_autocast", lambda: _Autocast())
 
     masks = sam_tracking.track_masks(np.zeros((1, 2, 3, 3), dtype=np.uint8))
 
