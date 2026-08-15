@@ -1,0 +1,18 @@
+# Fixed 16-condition subset for the AWM-CoCA overfit sanity experiment.
+# Selected at approximately uniform positions from the 203 sorted training conditions.
+001_task_327_episode_684757
+014_task_356_episode_662981
+027_task_378_episode_648592
+040_task_429_episode_684445
+053_task_440_episode_752932
+066_task_477_episode_725607
+079_task_486_episode_751236
+092_task_509_episode_769456
+105_task_521_episode_762165
+118_task_529_episode_761171
+131_task_566_episode_795349
+144_task_599_episode_838964
+157_task_666_episode_865446
+170_task_694_episode_882404
+183_task_729_episode_870819
+196_task_739_episode_880599

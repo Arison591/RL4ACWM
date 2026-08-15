@@ -79,6 +79,9 @@ eval:
   # 每个 condition 的 rollout seed 数（评估开销控制；与 rollout_batch_size 联动，
   # 会在一次 pipeline 推理里批量生成）。
   seeds_per_condition: 8
+  # 每次 pipeline 推理的 eval seed 数。保持 2 可避免 8-seed 单批在 A100 上产生显存峰值。
+  # 必须整除 seeds_per_condition。
+  rollout_batch_size: 2
   # 固定评估 seed：每轮评估用同一组 seed，奖励曲线只反映策略变化，可解释。
   seed: 12345678
   # 可选覆盖训练 reward 的 GT 模板；null 则沿用 reward.gt_video_template(s)。

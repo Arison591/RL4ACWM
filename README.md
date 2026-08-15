@@ -1,5 +1,8 @@
 # AWM-CoCA PSNR 远端训练交付说明
 
+固定 16 条、训练/评估同集的 4/8 卡小型 overfit 流程见
+[`OVERFIT16_REMOTE_README.md`](OVERFIT16_REMOTE_README.md)。
+
 这份说明面向拿到代码后负责在单机 4×A100 上训练的同学。交付不包含 Docker、Conda
 环境压缩包、模型权重或数据；环境由 `environment.yml` 创建，模型由脚本按固定 revision
 下载。

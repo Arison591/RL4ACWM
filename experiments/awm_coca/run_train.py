@@ -128,6 +128,21 @@ def apply_cli_overrides(config: dict[str, Any], args: argparse.Namespace) -> dic
         if value is not None:
             target = updated if section is None else updated[section]
             target[key] = value
+    eval_settings = updated.setdefault("eval", {})
+    eval_prep_root = getattr(args, "eval_prep_root", None)
+    if eval_prep_root:
+        eval_settings["prep_root"] = eval_prep_root
+        eval_settings["enabled"] = True
+    eval_scalar_overrides = (
+        (getattr(args, "eval_every_group_steps", None), "every_group_steps"),
+        (getattr(args, "eval_max_conditions", None), "max_conditions"),
+        (getattr(args, "eval_seeds_per_condition", None), "seeds_per_condition"),
+        (getattr(args, "eval_rollout_batch_size", None), "rollout_batch_size"),
+        (getattr(args, "eval_seed", None), "seed"),
+    )
+    for value, key in eval_scalar_overrides:
+        if value is not None:
+            eval_settings[key] = value
     if args.smoke_test:
         updated["rollout"]["group_size"] = 2
         # A group=2 smoke run can never satisfy the production threshold of 8;
@@ -271,6 +286,15 @@ def _preflight_eval(config: dict[str, Any]) -> dict[str, Any] | None:
         return None
     if int(eval_settings.get("every_group_steps", 10)) < 1:
         raise ValueError("eval.every_group_steps must be >= 1")
+    seeds_per_condition = int(eval_settings.get("seeds_per_condition", 2))
+    rollout_batch_size = int(eval_settings.get("rollout_batch_size", 1))
+    if seeds_per_condition < 1:
+        raise ValueError("eval.seeds_per_condition must be >= 1")
+    if rollout_batch_size < 1 or seeds_per_condition % rollout_batch_size:
+        raise ValueError(
+            "eval.rollout_batch_size must be positive and divide "
+            f"eval.seeds_per_condition ({seeds_per_condition})"
+        )
     eval_manifest, _ = build_manifest(
         eval_settings["prep_root"], validation_mode=eval_settings.get("validation_mode", "strict"),
     )
@@ -520,6 +544,7 @@ def _run_eval(
     rank, world_size = _distributed_info()
     max_conditions = eval_settings.get("max_conditions")
     seeds_per_condition = max(1, int(eval_settings.get("seeds_per_condition", 2)))
+    rollout_batch_size = int(eval_settings.get("rollout_batch_size", 1))
     eval_seed = int(eval_settings.get("seed", 12345))
 
     # 清理上次崩溃残留的 eval rollout 目录，避免 rollout_group 的 mkdir(exist_ok=False) 冲突。
@@ -543,7 +568,7 @@ def _run_eval(
         seeds = [eval_seed + offset for offset in range(seeds_per_condition)]
         group_dir, artifacts = runtime.rollout_group(
             prepared, seeds=seeds, output_dir=output / "eval",
-            expected_group_size=seeds_per_condition, rollout_batch_size=seeds_per_condition,
+            expected_group_size=seeds_per_condition, rollout_batch_size=rollout_batch_size,
         )
         # rollout_group 不落盘 trajectory.pt，credit 必须走内存 artifact。
         artifacts_by_seed = {artifact.seed: artifact for artifact in artifacts}
@@ -1043,6 +1068,12 @@ def main() -> None:
     parser.add_argument("--num-workers", type=int)
     parser.add_argument("--reward-workers", type=int)
     parser.add_argument("--checkpoint-every", type=int)
+    parser.add_argument("--eval-prep-root")
+    parser.add_argument("--eval-every-group-steps", type=int)
+    parser.add_argument("--eval-max-conditions", type=int)
+    parser.add_argument("--eval-seeds-per-condition", type=int)
+    parser.add_argument("--eval-rollout-batch-size", type=int)
+    parser.add_argument("--eval-seed", type=int)
     parser.add_argument("--keep-consumed-rollouts", action="store_true")
     parser.add_argument(
         "--rollout-retention",

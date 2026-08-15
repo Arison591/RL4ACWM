@@ -248,7 +248,7 @@ if [[ -n "${RESUME_CHECKPOINT}" ]]; then
   COMMON_ARGS+=(--resume "${RESUME_CHECKPOINT}")
 fi
 
-PYTHON_BIN="${PYTHON_BIN}" "${SCRIPT_DIR}/run_awm_coca.sh" preflight "${COMMON_ARGS[@]}"
+PYTHON_BIN="${PYTHON_BIN}" "${SCRIPT_DIR}/run_awm_coca.sh" preflight "${COMMON_ARGS[@]}" "$@"
 
 "${PYTHON_BIN}" -m experiments.awm_coca.run_train \
   --config "${REPO_ROOT}/configs/awm_coca_train.yaml" \
