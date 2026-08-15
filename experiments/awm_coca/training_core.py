@@ -131,7 +131,7 @@ def awm_coca_is_loss(
     losses: list[torch.Tensor] = []
     records: list[LossRecord] = []
     for sample in samples:
-        sample_loss, record = awm_coca_sample_loss(
+        sample_loss, record, _, _ = awm_coca_sample_loss(
             adapter, sample, proposal_config, beta=beta, generator=generator
         )
         losses.append(sample_loss)
@@ -146,7 +146,7 @@ def awm_coca_sample_loss(
     *,
     beta: float,
     generator: torch.Generator | None = None,
-) -> tuple[torch.Tensor, LossRecord]:
+) -> tuple[torch.Tensor, LossRecord, torch.Tensor, torch.Tensor]:
     """Build one rollout loss so a trainer can backward without retaining a whole group graph."""
     clean = sample.clean_latent.detach()
     base, _, proposal = build_proposal(sample.noise_scores, proposal_config, device=clean.device)
@@ -170,7 +170,12 @@ def awm_coca_sample_loss(
         reference = adapter.reference_velocity(noisy, time, sample.condition)
     fm_loss = F.mse_loss(prediction.float(), target.float())
     reference_kl = F.mse_loss(prediction.float(), reference.float())
-    sample_loss = importance * (float(sample.advantage) * fm_loss + float(beta) * reference_kl)
+    # 拆成两项返回：fm 项与 reference-KL 项，trainer 据此逐项统计梯度范数
+    # （importance 是两项的公共因子，拆后不影响相对梯度尺度）。
+    advantage = float(sample.advantage)
+    fm_term = importance * (advantage * fm_loss)
+    kl_term = importance * (float(beta) * reference_kl)
+    sample_loss = fm_term + kl_term
     return sample_loss, LossRecord(
         sample_id=sample.sample_id,
         noise_level_index=level,
@@ -178,8 +183,8 @@ def awm_coca_sample_loss(
         base_probability=float(base[level].item()),
         proposal_probability=float(probability.item()),
         importance_weight=float(importance.item()),
-        advantage=float(sample.advantage),
+        advantage=advantage,
         fm_loss=float(fm_loss.detach().item()),
         reference_kl=float(reference_kl.detach().item()),
         weighted_loss=float(sample_loss.detach().item()),
-    )
+    ), fm_term, kl_term

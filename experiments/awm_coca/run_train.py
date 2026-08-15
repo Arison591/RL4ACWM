@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import contextlib
 import copy
 import json
 import os
@@ -77,6 +78,19 @@ def resolve_train_paths(config: dict[str, Any]) -> dict[str, Any]:
         camera: _repo_path(template)
         for camera, template in reward.get("gt_video_templates", {}).items()
     }
+    if "eval" in resolved:
+        eval_settings = resolved["eval"]
+        if eval_settings.get("enabled", False):
+            if not eval_settings.get("prep_root"):
+                raise ValueError("eval.enabled requires eval.prep_root")
+            eval_settings["prep_root"] = _repo_path(eval_settings["prep_root"])
+            if eval_settings.get("gt_video_template"):
+                eval_settings["gt_video_template"] = _repo_path(eval_settings["gt_video_template"])
+            if eval_settings.get("gt_video_templates"):
+                eval_settings["gt_video_templates"] = {
+                    camera: _repo_path(template)
+                    for camera, template in eval_settings["gt_video_templates"].items()
+                }
     return resolved
 
 
@@ -123,6 +137,8 @@ def apply_cli_overrides(config: dict[str, Any], args: argparse.Namespace) -> dic
         updated["dataset"]["limit"] = 1
         updated["dataset"]["num_workers"] = 0
         updated["dataset"]["pin_memory"] = False
+        # 冒烟只跑 1 个训练 group，不付完整测试集 rollout+reward 的开销。
+        updated.setdefault("eval", {})["enabled"] = False
         updated["reward"]["workers"] = 1
         updated["checkpoint"]["every_optimizer_steps"] = 0
         updated.setdefault("storage", {})["rollout_retention"] = "all"
@@ -230,6 +246,67 @@ def preflight(
             )
     sampler = ResumableConditionSampler(len(manifest["samples"]), seed=int(config.get("seed", 42)))
     return manifest, sampler
+
+
+def _eval_gt_templates(config: dict[str, Any]) -> tuple[str, dict[str, str]]:
+    """Resolve the eval reward GT templates (eval override or training fallback)."""
+    eval_settings = config.get("eval", {})
+    head_template = eval_settings.get("gt_video_template")
+    camera_templates = eval_settings.get("gt_video_templates")
+    if head_template is None:
+        head_template = config["reward"]["gt_video_template"]
+    if camera_templates is None:
+        camera_templates = config["reward"].get("gt_video_templates", {})
+    return head_template, camera_templates
+
+
+def _preflight_eval(config: dict[str, Any]) -> dict[str, Any] | None:
+    """Build and validate the held-out eval manifest; None when eval is disabled.
+
+    Mirrors the training-manifest reward GT checks so `--preflight-only` catches
+    a broken eval set before any rollout runs.
+    """
+    eval_settings = config.get("eval", {})
+    if not eval_settings.get("enabled", False):
+        return None
+    if int(eval_settings.get("every_group_steps", 10)) < 1:
+        raise ValueError("eval.every_group_steps must be >= 1")
+    eval_manifest, _ = build_manifest(
+        eval_settings["prep_root"], validation_mode=eval_settings.get("validation_mode", "strict"),
+    )
+    head_template, camera_templates = _eval_gt_templates(config)
+    max_conditions = eval_settings.get("max_conditions")
+    entries = sorted(eval_manifest["samples"], key=lambda entry: entry["condition_id"])
+    if max_conditions is not None:
+        entries = entries[: int(max_conditions)]
+    missing_head = [
+        head_template.format(condition_id=entry["condition_id"])
+        for entry in entries
+        if not Path(head_template.format(condition_id=entry["condition_id"])).is_file()
+    ]
+    if missing_head:
+        raise FileNotFoundError(
+            f"missing {len(missing_head)} eval head GT videos; first: {missing_head[0]}"
+        )
+    reward_mode = config["reward"].get("mode", "action")
+    if reward_mode in {"geometry", "joint"}:
+        cameras = config["reward"].get("geometry_cameras", ())
+        missing_geometry = []
+        for entry in entries:
+            for camera in cameras:
+                if camera not in camera_templates:
+                    missing_geometry.append(f"missing eval template for camera={camera}")
+                    continue
+                path = camera_templates[camera].format(
+                    condition_id=entry["condition_id"], camera=camera
+                )
+                if not Path(path).is_file():
+                    missing_geometry.append(path)
+        if missing_geometry:
+            raise FileNotFoundError(
+                f"missing {len(missing_geometry)} eval geometry GT videos; first: {missing_geometry[0]}"
+            )
+    return eval_manifest
 
 
 def _loader(config: dict[str, Any], manifest: dict[str, Any], sampler: ResumableConditionSampler) -> DataLoader:
@@ -420,6 +497,113 @@ def _gather_per_rank(value: Any) -> list[Any]:
     return gathered
 
 
+def _run_eval(
+    config: dict[str, Any],
+    eval_config: dict[str, Any],
+    runtime: PersistentGeSimRuntime,
+    eval_rewards: AsyncRewardRunner,
+    output: Path,
+    eval_manifest: dict[str, Any],
+    *,
+    version: int,
+    group_step: int,
+    eval_logger: JsonlMetricLogger | None,
+    monitor: WandbMonitor | None,
+) -> None:
+    """Roll out the current policy on the held-out eval set and log aggregated reward.
+
+    Inference only — no policy update, no training-sampler consumption.  Each rank
+    rolls out its share of the (deterministically selected) eval conditions, then
+    rewards are gathered across ranks and logged by rank 0 under eval/*.
+    """
+    eval_settings = config["eval"]
+    rank, world_size = _distributed_info()
+    max_conditions = eval_settings.get("max_conditions")
+    seeds_per_condition = max(1, int(eval_settings.get("seeds_per_condition", 2)))
+    eval_seed = int(eval_settings.get("seed", 12345))
+
+    # 清理上次崩溃残留的 eval rollout 目录，避免 rollout_group 的 mkdir(exist_ok=False) 冲突。
+    eval_rollout_root = output / "eval" / "rollouts"
+    if eval_rollout_root.is_dir():
+        for stale in eval_rollout_root.iterdir():
+            if stale.is_dir():
+                shutil.rmtree(stale)
+
+    runtime.set_policy_version(version)
+    dataset = PrepConditionDataset(eval_manifest)
+    entries = sorted(eval_manifest["samples"], key=lambda entry: entry["condition_id"])
+    if max_conditions is not None:
+        entries = entries[: int(max_conditions)]
+    local_entries = entries[rank::world_size]
+
+    rows: list[dict[str, Any]] = []
+    for entry in local_entries:
+        raw = dataset[int(entry["index"])]
+        prepared = runtime.prepare_condition(raw)
+        seeds = [eval_seed + offset for offset in range(seeds_per_condition)]
+        group_dir, artifacts = runtime.rollout_group(
+            prepared, seeds=seeds, output_dir=output / "eval",
+            expected_group_size=seeds_per_condition, rollout_batch_size=seeds_per_condition,
+        )
+        # rollout_group 不落盘 trajectory.pt，credit 必须走内存 artifact。
+        artifacts_by_seed = {artifact.seed: artifact for artifact in artifacts}
+        _score_group(eval_config, eval_rewards, group_dir, raw, version, artifacts=artifacts_by_seed)
+        for row in _compact_rollout_rows(group_dir):
+            row["group_step"] = group_step
+            rows.append(row)
+        _remove_consumed_group(group_dir, output / "eval")
+
+    gathered = _gather_per_rank(rows)
+    global_rows = [item for group in gathered for item in group]
+    totals = [
+        float(row["reward"]["total_reward"])
+        for row in global_rows
+        if row["reward"].get("total_reward") is not None and row["reward"].get("valid", True)
+    ]
+    action_rewards = [
+        float(row["reward"]["action_reward"]) for row in global_rows
+        if row["reward"].get("action_reward") is not None and row["reward"].get("valid", True)
+    ]
+    geometry_rewards = [
+        float(row["reward"]["geometry_reward"]) for row in global_rows
+        if row["reward"].get("geometry_reward") is not None and row["reward"].get("valid", True)
+    ]
+
+    def _mean(values: list[float]) -> float | None:
+        return None if not values else float(sum(values) / len(values))
+
+    mean_reward = _mean(totals)
+    valid_fraction = float(len(totals) / len(global_rows)) if global_rows else None
+    if rank == 0:
+        row = {
+            "group_step": group_step,
+            "policy_version": version,
+            "n_conditions": len(entries),
+            "n_seeds": len(global_rows),
+            "n_valid_seeds": len(totals),
+            "mean_reward": mean_reward,
+            "mean_action_reward": _mean(action_rewards),
+            "mean_geometry_reward": _mean(geometry_rewards),
+            "valid_fraction": valid_fraction,
+            "condition_ids": [entry["condition_id"] for entry in entries],
+        }
+        if eval_logger is not None:
+            eval_logger.write(row)
+        if monitor is not None:
+            eval_payload = {
+                "eval/reward_total": mean_reward,
+                "eval/reward_action": _mean(action_rewards),
+                "eval/reward_geometry": _mean(geometry_rewards),
+                "eval/valid_fraction": valid_fraction,
+                "eval/policy_version": version,
+                "eval/n_valid_seeds": len(totals),
+            }
+            monitor.log_eval(
+                {key: value for key, value in eval_payload.items() if value is not None},
+                group_step=group_step,
+            )
+
+
 def _assert_group_alignment(condition_id: str, policy_version: int, group_counter: int) -> None:
     """Fail early if ranks are about to train different logical groups."""
     local = (str(condition_id), int(policy_version), int(group_counter))
@@ -481,11 +665,16 @@ def _global_group_metrics(per_rank: list[dict[str, Any]]) -> dict[str, Any]:
     versions = {(row["optimizer_step"], row["policy_version"], row["optimizer_stepped"]) for row in per_rank}
     if len(versions) != 1:
         raise RuntimeError(f"distributed trainer state diverged across ranks: {sorted(versions)}")
-    grad_norms = [float(row["grad_norm"]) for row in per_rank if row["grad_norm"] is not None]
+    def _averaged(key: str) -> float | None:
+        values = [float(row[key]) for row in per_rank if row.get(key) is not None]
+        return None if not values else float(sum(values) / len(values))
+
     return {
         **first,
         "loss": float(sum(float(row["loss"]) for row in per_rank) / len(per_rank)),
-        "grad_norm": None if not grad_norms else float(sum(grad_norms) / len(grad_norms)),
+        "grad_norm": _averaged("grad_norm"),
+        "fm_grad_norm": _averaged("fm_grad_norm"),
+        "kl_grad_norm": _averaged("kl_grad_norm"),
         "samples": [sample for row in per_rank for sample in row["samples"]],
         "world_size": len(per_rank),
     }
@@ -531,6 +720,14 @@ def train(config: dict[str, Any], *, resume: str | None = None, device: str = "c
     manifest, sampler = preflight(config, write_outputs=rank == 0)
     if world_size > 1:
         dist.barrier()
+    eval_manifest = _preflight_eval(config)
+    eval_config = None
+    if eval_manifest is not None:
+        # 独立测试集：评估奖励沿用训练 reward 口径，但 GT 模板允许 eval 配置覆盖。
+        eval_config = copy.deepcopy(config)
+        head_template, camera_templates = _eval_gt_templates(config)
+        eval_config["reward"]["gt_video_template"] = head_template
+        eval_config["reward"]["gt_video_templates"] = dict(camera_templates)
     runtime = PersistentGeSimRuntime(config, device=device)
     # The GE-Sim rollout pipeline re-derives its own sigma schedule inside
     # infer() (gesim_pipeline.py uses sigmas=linspace(0,1,N), then applies the
@@ -564,6 +761,7 @@ def train(config: dict[str, Any], *, resume: str | None = None, device: str = "c
             beta=float(optimizer_config["reference_kl_beta"]),
             gradient_accumulation_steps=int(optimizer_config["gradient_accumulation_steps"]),
             warmup_steps=int(optimizer_config["warmup_steps"]),
+            log_term_grad_norm=bool(optimizer_config.get("log_term_grad_norm", True)),
         ), ema=ema,
     )
     restored_group_counter: int | None = None
@@ -588,6 +786,10 @@ def train(config: dict[str, Any], *, resume: str | None = None, device: str = "c
     output = Path(config["output_dir"])
     logger = JsonlMetricLogger(output / "metrics" / "train.jsonl") if rank == 0 else None
     rollout_logger = JsonlMetricLogger(output / "metrics" / "rollouts.jsonl") if rank == 0 else None
+    eval_logger = JsonlMetricLogger(output / "metrics" / "eval.jsonl") if rank == 0 else None
+    eval_every = (
+        int(config["eval"].get("every_group_steps", 10)) if eval_manifest is not None else 0
+    )
     max_steps = int(config["max_optimizer_steps"])
     conditions_per_epoch = len(sampler)
     accumulation_steps = int(optimizer_config["gradient_accumulation_steps"])
@@ -620,6 +822,15 @@ def train(config: dict[str, Any], *, resume: str | None = None, device: str = "c
         progress.write(
             f"[INFO][rank {rank}] 训练与 reward worker 绑定 logical cuda:{reward_cuda_device}"
         )
+    eval_reward_ctx = (
+        AsyncRewardRunner(
+            _reward_function(eval_config),
+            workers=int(config["reward"].get("workers", 1)),
+            cuda_device=reward_cuda_device,
+        )
+        if eval_config is not None
+        else contextlib.nullcontext(None)
+    )
     with (
         progress,
         WandbMonitor(config, output, enabled=rank == 0) as monitor,
@@ -628,10 +839,20 @@ def train(config: dict[str, Any], *, resume: str | None = None, device: str = "c
             workers=int(config["reward"].get("workers", 1)),
             cuda_device=reward_cuda_device,
         ) as rewards,
+        eval_reward_ctx as eval_rewards,
     ):
         checkpoint_writer = AsyncCheckpointWriter() if rank == 0 else None
         while trainer.optimizer_step < max_steps:
             for raw in _loader(config, manifest, sampler):
+                # 每 eval_every 个 group step 在独立测试集上评估一次（group 0 先出基线）。
+                # 只做 rollout+reward，不更新策略、不推进训练 sampler；group_counter 全局一致，
+                # 所有 rank 同时进入评估，各负责自己那份 condition。
+                if eval_manifest is not None and group_counter % eval_every == 0:
+                    _run_eval(
+                        config, eval_config, runtime, eval_rewards, output, eval_manifest,
+                        version=trainer.policy_version, group_step=group_counter,
+                        eval_logger=eval_logger, monitor=monitor,
+                    )
                 group_started_at = time.monotonic()
                 # DataLoader worker 预取会提前推进 sampler.position，不能用它显示消费进度。
                 # group_counter 只在一个 group 真正完成后递增，因此对进度与断点恢复都准确。
@@ -850,8 +1071,17 @@ def main() -> None:
         return
     if args.preflight_only:
         manifest, _ = preflight(config, write_outputs=env_rank == 0)
+        eval_manifest = _preflight_eval(config)
         if env_rank == 0:
-            print(json.dumps({"manifest_sha256": manifest["sha256"], "num_samples": manifest["num_samples"]}))
+            eval_info = (
+                {"num_eval_samples": eval_manifest["num_samples"]}
+                if eval_manifest is not None
+                else {"eval": "disabled"}
+            )
+            print(json.dumps({
+                "manifest_sha256": manifest["sha256"], "num_samples": manifest["num_samples"],
+                **eval_info,
+            }))
         return
     initialized_here = False
     train_device = args.device

@@ -62,6 +62,28 @@ optimizer:
   gradient_accumulation_steps: 1
   warmup_steps: 100
   reference_kl_beta: 0.01
+  # 逐项梯度范数统计（fm 项 / reference-KL 项，wandb: trainer/fm_grad_norm、
+  # trainer/kl_grad_norm）。开启时每个样本多一次 autograd.grad（KL 项）用于统计，
+  # 主 backward 仍只执行一次。用于判断两项损失梯度是否同量级后再调 reference_kl_beta。
+  log_term_grad_norm: true
+
+eval:
+  enabled: true
+  # 独立测试集数据目录（与训练 dataset.prep_root 分开），结构同 prep 数据。
+  prep_root: output/prep_eval
+  validation_mode: strict
+  # 每 N 个 group step 在测试集上评估一次；group 0 先出基线（初始策略）。
+  every_group_steps: 10
+  # 每次评估最多评估的测试 condition 数；null 表示全部。
+  max_conditions: null
+  # 每个 condition 的 rollout seed 数（评估开销控制；与 rollout_batch_size 联动，
+  # 会在一次 pipeline 推理里批量生成）。
+  seeds_per_condition: 8
+  # 固定评估 seed：每轮评估用同一组 seed，奖励曲线只反映策略变化，可解释。
+  seed: 12345678
+  # 可选覆盖训练 reward 的 GT 模板；null 则沿用 reward.gt_video_template(s)。
+  gt_video_template: null
+  gt_video_templates: null
 
 ema:
   enabled: true

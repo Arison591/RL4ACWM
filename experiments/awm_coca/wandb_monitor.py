@@ -141,6 +141,9 @@ class WandbMonitor:
             payload["trainer/mean_reward"] = float(train_row["mean_reward"])
         if train_row.get("grad_norm") is not None:
             payload["trainer/grad_norm"] = float(train_row["grad_norm"])
+        for key in ("fm_grad_norm", "kl_grad_norm"):
+            if train_row.get(key) is not None:
+                payload[f"trainer/{key}"] = float(train_row[key])
         for key in (
             "advantage", "fm_loss", "reference_kl", "weighted_loss", "importance_weight",
             "proposal_probability", "noise_time", "noise_level_index",
@@ -223,6 +226,15 @@ class WandbMonitor:
                 rollout_rows, optimizer_step=int(train_row["optimizer_step"])
             ))
             self.run.log(payload)
+        except Exception as exc:
+            self._disable("上传失败", exc)
+
+    def log_eval(self, payload: dict[str, Any], *, group_step: int) -> None:
+        """Log a held-out evaluation round (keys are already eval/*-prefixed)."""
+        if self.run is None:
+            return
+        try:
+            self.run.log({"trainer/group_step": int(group_step), **payload})
         except Exception as exc:
             self._disable("上传失败", exc)
 
