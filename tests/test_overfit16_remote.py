@@ -10,6 +10,7 @@ from pathlib import Path
 import pytest
 
 from experiments.awm_coca.run_train import (
+    _prepare_eval_rollout_root,
     _preflight_eval,
     apply_cli_overrides,
     load_train_config,
@@ -98,6 +99,27 @@ def test_eval_batch_size_must_divide_seed_count(tmp_path: Path) -> None:
 
     with pytest.raises(ValueError, match="must be positive and divide"):
         _preflight_eval(config)
+
+
+def test_eval_cleanup_is_rank_zero_only_and_synchronized(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    stale = tmp_path / "eval" / "rollouts" / "stale_group"
+    stale.mkdir(parents=True)
+    (stale / "group.json").write_text("{}", encoding="utf-8")
+    barriers: list[str] = []
+    monkeypatch.setattr(
+        "experiments.awm_coca.run_train.dist.barrier",
+        lambda: barriers.append("barrier"),
+    )
+
+    _prepare_eval_rollout_root(tmp_path, rank=3, world_size=8)
+    assert stale.is_dir()
+    assert barriers == ["barrier"]
+
+    _prepare_eval_rollout_root(tmp_path, rank=0, world_size=8)
+    assert not stale.exists()
+    assert barriers == ["barrier", "barrier"]
 
 
 @pytest.mark.parametrize("gpu_count", [4, 8])

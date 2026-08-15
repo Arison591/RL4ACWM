@@ -521,6 +521,22 @@ def _gather_per_rank(value: Any) -> list[Any]:
     return gathered
 
 
+def _prepare_eval_rollout_root(output: Path, *, rank: int, world_size: int) -> None:
+    """Clean stale eval groups once, then release every rank together.
+
+    The eval output is shared by all local ranks.  Letting every rank remove
+    stale directories races with faster ranks already writing their new groups,
+    which can delete a freshly-created ``group.json`` mid-evaluation.
+    """
+    eval_rollout_root = output / "eval" / "rollouts"
+    if rank == 0 and eval_rollout_root.is_dir():
+        for stale in eval_rollout_root.iterdir():
+            if stale.is_dir():
+                shutil.rmtree(stale)
+    if world_size > 1:
+        dist.barrier()
+
+
 def _run_eval(
     config: dict[str, Any],
     eval_config: dict[str, Any],
@@ -547,12 +563,8 @@ def _run_eval(
     rollout_batch_size = int(eval_settings.get("rollout_batch_size", 1))
     eval_seed = int(eval_settings.get("seed", 12345))
 
-    # 清理上次崩溃残留的 eval rollout 目录，避免 rollout_group 的 mkdir(exist_ok=False) 冲突。
-    eval_rollout_root = output / "eval" / "rollouts"
-    if eval_rollout_root.is_dir():
-        for stale in eval_rollout_root.iterdir():
-            if stale.is_dir():
-                shutil.rmtree(stale)
+    # 共享目录只由 rank 0 清理；barrier 后所有 rank 再开始写各自的新 group。
+    _prepare_eval_rollout_root(output, rank=rank, world_size=world_size)
 
     runtime.set_policy_version(version)
     dataset = PrepConditionDataset(eval_manifest)
