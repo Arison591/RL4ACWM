@@ -101,6 +101,23 @@ def get_sam3_video_model():
     return _sam3_video
 
 
+def _sam3_prompt_autocast():
+    """Use the mixed-precision context required by SAM3's prompt path.
+
+    SAM3's detector can return BF16 tracker-backbone features (in particular
+    after its propagation path has been compiled), while the tracker mask
+    decoder keeps FP32 convolution parameters.  The upstream predictor wraps
+    ``model.add_prompt`` in CUDA BF16 autocast so PyTorch casts those
+    convolution parameters consistently.  This project calls the underlying
+    video model directly, so it must provide the same context itself.
+    """
+    return torch.autocast(
+        device_type="cuda",
+        dtype=torch.bfloat16,
+        enabled=torch.cuda.is_available(),
+    )
+
+
 DEFAULT_EEF_PROMPT = "robot arm"  # 默认 EEF 文本 prompt
 
 
@@ -139,7 +156,11 @@ def track_masks(
     inference_state = model.init_state(init_input)
 
     # 2. 纯文本 prompt（无首帧 mask / box；add_prompt 的 text_str 直接驱动全序列分割）
-    model.add_prompt(inference_state, frame_idx=0, text_str=prompt)
+    # Match SAM3's official predictor wrapper.  Without this context, a model
+    # reused after evaluation/propagation may feed BF16 backbone features into
+    # FP32 mask-decoder convolutions and fail before the training reward step.
+    with _sam3_prompt_autocast():
+        model.add_prompt(inference_state, frame_idx=0, text_str=prompt)
 
     # 3. propagate → 逐帧 mask
     H = inference_state["orig_height"]
