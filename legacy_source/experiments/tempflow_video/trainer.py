@@ -3,7 +3,7 @@ from __future__ import annotations
 import math
 import random
 from dataclasses import dataclass
-from typing import Iterable, Sequence
+from typing import Callable, Iterable, Sequence
 
 import torch
 
@@ -40,6 +40,7 @@ class TempFlowOptimizerConfig:
     kl_beta: float = 0.01
     warmup_steps: int = 0
     log_term_grad_norm: bool = True
+    log_gradient_cosine: bool = False
 
 
 class TempFlowVideoTrainer:
@@ -50,10 +51,12 @@ class TempFlowVideoTrainer:
         policy: VideoPolicyAdapter,
         reference: ReferencePolicyAdapter,
         config: TempFlowOptimizerConfig,
+        gradient_reducer: Callable[[Sequence[torch.Tensor]], None] | None = None,
     ) -> None:
         self.policy = policy
         self.reference = reference
         self.config = config
+        self.gradient_reducer = gradient_reducer
         self.parameters = policy.get_trainable_parameters()
         self.optimizer = torch.optim.AdamW(
             self.parameters,
@@ -72,10 +75,18 @@ class TempFlowVideoTrainer:
         self.group_attempts = 0
         self.rollout_epoch = 0
         self._consumed_groups: set[str] = set()
+        self._previous_gradients: list[torch.Tensor] | None = None
 
-    def _validate_group(self, rollouts: Sequence[BranchRollout | OrdinaryRollout]) -> str:
-        if len(rollouts) < 2:
-            raise ValueError("TempFlow update requires at least two branch rollouts")
+    def _validate_group(
+        self,
+        rollouts: Sequence[BranchRollout | OrdinaryRollout],
+        *,
+        global_group_size: int,
+    ) -> str:
+        if not rollouts:
+            raise ValueError("every distributed rank needs at least one local branch rollout")
+        if global_group_size < 2 or len(rollouts) > global_group_size:
+            raise ValueError("TempFlow update requires at least two global branch rollouts")
         group_ids = {item.group_key.group_id(item.policy_version) for item in rollouts}
         if len(group_ids) != 1:
             raise ValueError("advantage group mixes incompatible rollout metadata")
@@ -93,15 +104,22 @@ class TempFlowVideoTrainer:
         return group_id
 
     def update_group(
-        self, rollouts: Sequence[BranchRollout | OrdinaryRollout]
+        self,
+        rollouts: Sequence[BranchRollout | OrdinaryRollout],
+        *,
+        global_group_size: int | None = None,
     ) -> TrainerStepRecord:
-        group_id = self._validate_group(rollouts)
-        record = self._update_rollouts(rollouts)
+        global_count = int(global_group_size or len(rollouts))
+        group_id = self._validate_group(rollouts, global_group_size=global_count)
+        record = self._update_rollouts(rollouts, global_rollout_count=global_count)
         self._consumed_groups.add(group_id)
         return record
 
     def _update_rollouts(
-        self, rollouts: Sequence[BranchRollout | OrdinaryRollout]
+        self,
+        rollouts: Sequence[BranchRollout | OrdinaryRollout],
+        *,
+        global_rollout_count: int | None = None,
     ) -> TrainerStepRecord:
         """Apply one optimizer step to a minibatch already validated as on-policy.
 
@@ -114,11 +132,11 @@ class TempFlowVideoTrainer:
 
         if not rollouts:
             raise ValueError("TempFlow minibatch must not be empty")
+        global_count = int(global_rollout_count or len(rollouts))
         self.reference.assert_unchanged()
         self.policy.policy_model.train()
-        trainable_versions = [int(parameter._version) for parameter in self.parameters]
+        trainable_before = [parameter.detach().clone() for parameter in self.parameters]
         self.optimizer.zero_grad(set_to_none=True)
-        count = len(rollouts)
         term_buffers = None
         if self.config.log_term_grad_norm:
             term_buffers = {
@@ -128,7 +146,9 @@ class TempFlowVideoTrainer:
         metric_rows: list[dict[str, float]] = []
         for rollout in rollouts:
             actions = rollout.transitions if isinstance(rollout, OrdinaryRollout) else [rollout]
-            action_scale = 1.0 / (count * len(actions))
+            # Every rank contributes its local shard to one global group mean.
+            # The reducer performs SUM, so no extra world-size division belongs here.
+            action_scale = 1.0 / (global_count * len(actions))
             for action in actions:
                 current = action.current_latent.to(self.policy.runtime.device)
                 collected_next = action.next_latent.to(self.policy.runtime.device)
@@ -198,10 +218,42 @@ class TempFlowVideoTrainer:
                 )
                 metric_rows.append(row)
 
+        if self.gradient_reducer is not None:
+            gradients = []
+            for parameter in self.parameters:
+                if parameter.grad is None:
+                    parameter.grad = torch.zeros_like(parameter)
+                gradients.append(parameter.grad)
+            self.gradient_reducer(gradients)
+            if term_buffers is not None:
+                for buffers in term_buffers.values():
+                    self.gradient_reducer(buffers)
+
         total_grad_norm_before = _gradient_norm(parameter.grad for parameter in self.parameters)
         if not math.isfinite(total_grad_norm_before):
             self.optimizer.zero_grad(set_to_none=True)
             raise FloatingPointError("non-finite TempFlow gradient")
+        gradient_cosine = 0.0
+        has_previous_gradient = 0.0
+        if self.config.log_gradient_cosine:
+            current_gradients = [
+                (torch.zeros_like(parameter) if parameter.grad is None else parameter.grad)
+                .detach()
+                .float()
+                .cpu()
+                for parameter in self.parameters
+            ]
+            if self._previous_gradients is not None:
+                dot = sum(
+                    float((current * previous).sum().item())
+                    for current, previous in zip(current_gradients, self._previous_gradients)
+                )
+                current_norm = _gradient_norm(current_gradients)
+                previous_norm = _gradient_norm(self._previous_gradients)
+                if current_norm > 0.0 and previous_norm > 0.0:
+                    gradient_cosine = dot / (current_norm * previous_norm)
+                    has_previous_gradient = 1.0
+            self._previous_gradients = current_gradients
         clip_result = torch.nn.utils.clip_grad_norm_(self.parameters, self.config.max_grad_norm)
         if not torch.isfinite(clip_result):
             self.optimizer.zero_grad(set_to_none=True)
@@ -213,9 +265,13 @@ class TempFlowVideoTrainer:
         self.optimizer_step += 1
         self.policy_version += 1
         self.reference.assert_unchanged()
+        parameter_delta_squared = sum(
+            float((parameter.detach() - before).float().square().sum().item())
+            for parameter, before in zip(self.parameters, trainable_before)
+        )
         changed_trainable_count = sum(
-            int(parameter._version) != version
-            for parameter, version in zip(self.parameters, trainable_versions)
+            not torch.equal(parameter.detach(), before)
+            for parameter, before in zip(self.parameters, trainable_before)
         )
         if changed_trainable_count == 0:
             raise RuntimeError("optimizer step did not mutate any trainable policy parameter")
@@ -238,6 +294,9 @@ class TempFlowVideoTrainer:
                 "total_grad_norm_after_clip": total_grad_norm_after,
                 "learning_rate": float(self.optimizer.param_groups[0]["lr"]),
                 "changed_trainable_parameter_tensors": float(changed_trainable_count),
+                "parameter_delta_norm": math.sqrt(parameter_delta_squared),
+                "gradient_cosine_with_previous_step": float(gradient_cosine),
+                "gradient_cosine_has_previous_step": has_previous_gradient,
             }
         )
         return TrainerStepRecord(
@@ -255,6 +314,7 @@ class TempFlowVideoTrainer:
         shuffle: bool = True,
         seed: int = 0,
         max_updates: int | None = None,
+        global_group_sizes: Sequence[int] | None = None,
     ) -> list[TrainerStepRecord]:
         """Train on groups collected under one frozen policy snapshot.
 
@@ -273,16 +333,20 @@ class TempFlowVideoTrainer:
             raise ValueError("max_updates must be positive when provided")
 
         collection_policy_version = self.policy_version
+        if global_group_sizes is None:
+            global_group_sizes = [len(group) for group in groups]
+        if len(global_group_sizes) != len(groups):
+            raise ValueError("global_group_sizes must match rollout buffer groups")
         group_ids: list[str] = []
-        normalized_groups: list[list[BranchRollout | OrdinaryRollout]] = []
-        for group in groups:
-            group_id = self._validate_group(group)
+        normalized_groups: list[tuple[list[BranchRollout | OrdinaryRollout], int]] = []
+        for group, global_size in zip(groups, global_group_sizes):
+            group_id = self._validate_group(group, global_group_size=int(global_size))
             if group_id in group_ids:
                 raise ValueError(f"rollout buffer repeats group: {group_id}")
             if {item.policy_version for item in group} != {collection_policy_version}:
                 raise ValueError("rollout buffer mixes old-policy snapshots")
             group_ids.append(group_id)
-            normalized_groups.append(list(group))
+            normalized_groups.append((list(group), int(global_size)))
 
         records: list[TrainerStepRecord] = []
         rng = random.Random(int(seed))
@@ -297,8 +361,14 @@ class TempFlowVideoTrainer:
                 for batch_index in range(batch_count):
                     start = batch_index * len(ordered) // batch_count
                     stop = (batch_index + 1) * len(ordered) // batch_count
-                    minibatch = [rollout for group in ordered[start:stop] for rollout in group]
-                    records.append(self._update_rollouts(minibatch))
+                    selected = ordered[start:stop]
+                    minibatch = [rollout for group, _ in selected for rollout in group]
+                    global_count = sum(global_size for _, global_size in selected)
+                    records.append(
+                        self._update_rollouts(
+                            minibatch, global_rollout_count=global_count
+                        )
+                    )
                     if max_updates is not None and len(records) >= int(max_updates):
                         return records
         finally:
