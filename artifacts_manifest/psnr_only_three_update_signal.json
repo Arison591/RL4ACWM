@@ -1,0 +1,14 @@
+{
+  "kind": "external_training_signal",
+  "repository_artifacts_committed": false,
+  "run_root": "${TEMPFLOW_OUTPUT_ROOT}/psnr_only_overfit224/runs/20260816T060436Z",
+  "completed_optimizer_updates": 3,
+  "completed_branch_timesteps": [0, 1, 2],
+  "branch_factor": 6,
+  "action_reward_enabled": false,
+  "training_reward": "raw_future_only_balanced_psnr_db",
+  "stopped_by_user_request": true,
+  "checkpoint_created": false,
+  "scheduled_evaluations_reached": [],
+  "notes": "Update 3 is complete in groups.jsonl. The process was interrupted during the next forward pass; there is no fourth update."
+}
