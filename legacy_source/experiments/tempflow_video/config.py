@@ -51,15 +51,18 @@ def load_tempflow_config(path: str | Path) -> dict[str, Any]:
         raise ValueError("TempFlow config must be a YAML mapping")
     base_path = local.pop("base_config", None)
     if base_path is None:
-        raise ValueError("TempFlow config must declare base_config")
-    base_path = Path(_expand(base_path))
-    if not base_path.is_absolute():
-        base_path = (REPO_ROOT / base_path).resolve()
-    with base_path.open("r", encoding="utf-8") as handle:
-        base = yaml.safe_load(handle)
-    config = _expand(_deep_merge(base, local))
+        # Also accept a previously dumped effective config. This keeps the
+        # relocated audit tools independent of the publish repository layout.
+        config = _expand(local)
+    else:
+        base_path = Path(_expand(base_path))
+        if not base_path.is_absolute():
+            base_path = (REPO_ROOT / base_path).resolve()
+        with base_path.open("r", encoding="utf-8") as handle:
+            base = yaml.safe_load(handle)
+        config = _expand(_deep_merge(base, local))
     config["_config_path"] = str(config_path)
-    config["_base_config_path"] = str(base_path)
+    config["_base_config_path"] = None if base_path is None else str(base_path)
     mode = config.get("experiment", {}).get("mode")
     if mode not in EXPERIMENT_MODES:
         raise ValueError(f"unknown experiment.mode={mode!r}; expected {sorted(EXPERIMENT_MODES)}")

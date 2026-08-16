@@ -12,8 +12,7 @@
     "saved_real_parity_ok": true,
     "tolerance": 1e-8,
     "errors": 0,
-    "fresh_recompute": "SAM completed; stopped before result because ultralytics is absent"
+    "fresh_recompute": "SAM and YOLO completed; stopped before result because CoWTracker xformers is absent"
   },
   "payload_committed": false
 }
-

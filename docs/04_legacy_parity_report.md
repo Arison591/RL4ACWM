@@ -14,5 +14,5 @@ the pinned clean upstream using the same effective configuration, first conditio
 All 16 trajectory hashes and all three encoded-view MP4 SHA-256 values were identical.
 
 The saved real Action/joint parity report for the same condition remains `ok=true` at `1e-8` with zero
-errors. A fresh recomputation was attempted: SAM propagation completed, but the local reward environment
-then lacked `ultralytics`. No numeric mismatch was observed; the fresh run did not reach a result.
+errors. A fresh recomputation was attempted: SAM and YOLO initialization completed, but CoWTracker then
+required unavailable `xformers`. No numeric mismatch was observed; the fresh run did not reach a result.
