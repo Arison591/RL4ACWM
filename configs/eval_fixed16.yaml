@@ -1,0 +1,7 @@
+experiment: {name: eval_fixed16}
+upstream: {commit: dce69e48a952449e873a791812e506df878bc8a9}
+dataset: {name: fixed16, shuffle: false}
+evaluation: {generation_seeds: [12345678], samples: 16}
+psnr: {evaluation_frame_scope: [full, future_only]}
+logging: {wandb_mode: offline}
+
