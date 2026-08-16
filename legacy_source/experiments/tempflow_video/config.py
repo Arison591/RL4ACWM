@@ -60,6 +60,14 @@ def load_tempflow_config(path: str | Path) -> dict[str, Any]:
             base_path = (REPO_ROOT / base_path).resolve()
         with base_path.open("r", encoding="utf-8") as handle:
             base = yaml.safe_load(handle)
+        grand_path = base.pop("base_config", None)
+        if grand_path is not None:
+            grand_path = Path(_expand(grand_path))
+            if not grand_path.is_absolute():
+                grand_path = (REPO_ROOT / grand_path).resolve()
+            with grand_path.open("r", encoding="utf-8") as handle:
+                grand = yaml.safe_load(handle)
+            base = _deep_merge(grand, base)
         config = _expand(_deep_merge(base, local))
     config["_config_path"] = str(config_path)
     config["_base_config_path"] = None if base_path is None else str(base_path)

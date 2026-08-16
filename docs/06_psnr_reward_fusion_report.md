@@ -20,6 +20,17 @@ RMS sigmoid-PSNR contribution 0.50070, a PSNR/Action ratio of 0.51685. Across al
 claimed tenfold suppression; they still show that nominal 0.5/0.5 did not mean equal normalized
 contribution.
 
+These numbers use a different denominator from the earlier “about 13.3×” statement. That earlier
+statement compared the two component standard deviations *inside a typical group* before total-reward
+normalization. On the final 60-group/360-branch snapshot, the median
+`std(Action) / std(sigmoid-PSNR)` is 11.8269 (31/60 groups exceed 10×); the earlier approximately
+336-branch snapshot ended at a different policy/group boundary, hence its approximately 13.3 value.
+By contrast, 0.51685 is the ratio of cross-branch RMS values after each centered component is divided
+by that group's `std(total)+epsilon`. Early timesteps with much larger PSNR variation receive large
+values under this statistic and lift the pooled RMS. For reference, ratio-of-mean group stds is 3.7441,
+mean absolute normalized contribution ratio is 0.32861, and pooled-across-all-conditions raw component
+std ratio is 0.53930. None of these is an interchangeable definition of “contribution.”
+
 With component normalization and 0.5/0.5 weights, weighted advantage RMS was 0.37062 for Action and
 0.37460 for PSNR. Effective PSNR groups were 60/60 and skipped groups 0/60. Pairwise Action/PSNR
 ranking conflict was 50.22%. Positive affine z-scoring and clipping do not change PSNR ordering.
@@ -29,4 +40,3 @@ from near-numerical noise.
 This establishes that raw Action variance no longer suppresses PSNR advantage. It does not establish
 equal gradient contribution: weighted gradient norms depend on policy Jacobians and must be measured
 during a real AWM smoke/formal run.
-

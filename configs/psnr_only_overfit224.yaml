@@ -1,0 +1,68 @@
+base_config: ${AWM_UPSTREAM_ROOT}/configs/awm_coca_train.yaml
+output_dir: ${TEMPFLOW_OUTPUT_ROOT}/psnr_only_overfit224
+max_optimizer_steps: 224
+seed: 42
+experiment: {name: psnr_only_overfit224, mode: tempflow_full}
+dataset:
+  prep_root: ${TEMPFLOW_DATA_ROOT}/prep
+  ids_file: ${AWM_UPSTREAM_ROOT}/configs/awm_coca_overfit16_ids.txt
+  include_samples: []
+  exclude_samples: []
+  limit: 0
+  shuffle: false
+  num_workers: 0
+  pin_memory: false
+  persistent_workers: false
+model:
+  gesim_config: ${AWM_UPSTREAM_ROOT}/configs/cosmos_model/acwm_cosmos.yaml
+  checkpoint_root: ${AWM_ASSET_ROOT}/checkpoints
+  dtype: bf16
+  train_mode: lora
+  lora_rank: 32
+  lora_alpha: 64
+  lora_dropout: 0.0
+  lora_init: gaussian
+  gradient_checkpointing: true
+rollout: {history_frames: 4, future_frames: 25, total_frames: 29, chunks: 1, group_size: 6, reverse_denoise_steps: 15, rollout_batch_size: 1}
+reward:
+  mode: geometry
+  geometry_enabled: true
+  gt_video_template: ${TEMPFLOW_DATA_ROOT}/selected_samples/samples/{condition_id}/head_29_frames.mp4
+  gt_video_templates:
+    head: ${TEMPFLOW_DATA_ROOT}/selected_samples/samples/{condition_id}/head_29_frames.mp4
+    hand_left: ${TEMPFLOW_DATA_ROOT}/selected_samples/samples/{condition_id}/hand_left_29_frames.mp4
+    hand_right: ${TEMPFLOW_DATA_ROOT}/selected_samples/samples/{condition_id}/hand_right_29_frames.mp4
+  geometry_cameras: [head, hand_left, hand_right]
+  geometry_future_start: 4
+  geometry_future_end: 28
+  geometry_mean_weight: 0.6
+  geometry_worst_weight: 0.4
+  geometry_psnr_center_db: 20.4
+  geometry_psnr_temperature_db: 1.8
+  min_valid_seeds_per_group: 2
+  time_alignment_protocol: legacy_frame_index_truncate
+tempflow:
+  eta: 0.7
+  branch_factor: 6
+  branch_timesteps: [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13]
+  initial_seed: 123456
+  branch_noise_seed_base: 910000
+  advantage_epsilon: 1.0e-6
+  noise_weight_normalization: schedule_mean
+optimizer:
+  learning_rate: 1.0e-6
+  clip_range: 1.0e-4
+  reference_kl_beta: 0.01
+  warmup_steps: 10
+  log_term_grad_norm: true
+reward_fusion:
+  mode: psnr_only_raw_db
+  lambda_action: 0.0
+  lambda_psnr: 1.0
+  advantage_clip: 1.0
+  psnr_min_group_std_db: 0.0002
+training: {max_optimizer_steps: 224, checkpoint_every: 112, mixed_precision: bf16}
+sampling: {fixed_seed: true, reduced_sampling_steps: false, smoke_only: false}
+evaluation: {fixed_samples: 16, fixed_generation_seeds: [12345678], every_optimizer_steps: 112}
+logging: {wandb_mode: offline}
+

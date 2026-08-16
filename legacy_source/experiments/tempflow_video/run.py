@@ -228,7 +228,8 @@ def train(config: dict[str, Any], run_dir: Path, *, resume: str | None, max_step
     attempts = trainer.group_attempts
     max_attempts = max(target_steps * 4, target_steps + 2)
     while trainer.optimizer_step < target_steps and attempts < max_attempts:
-        condition_index = attempts % len(dataset)
+        # One formal epoch is the full Cartesian condition x legal-timestep grid.
+        condition_index = (attempts // len(timesteps)) % len(dataset) if branching else attempts % len(dataset)
         branch_timestep = timesteps[attempts % len(timesteps)] if branching else None
         raw = dataset[condition_index]
         prepared = runtime.prepare_condition(raw)
@@ -264,10 +265,13 @@ def train(config: dict[str, Any], run_dir: Path, *, resume: str | None, max_step
         for rollout in rollouts:
             try:
                 result = reward.score_rollout(rollout, prep_dir=raw.sample_dir)
-                total = float(result["total_reward"])
-                if not math.isfinite(total):
-                    raise FloatingPointError("terminal reward is non-finite")
-                rewards.append(total)
+                if config.get("reward_fusion", {}).get("mode") == "psnr_only_raw_db":
+                    training_reward = float(result["geometry"]["metrics"]["balanced_psnr_db"])
+                else:
+                    training_reward = float(result["total_reward"])
+                if not math.isfinite(training_reward):
+                    raise FloatingPointError("terminal training reward is non-finite")
+                rewards.append(training_reward)
                 valid_rollouts.append(rollout)
             except Exception as exc:
                 _jsonl(run_dir / "invalid_rollouts.jsonl", {"sample_id": rollout.sample_id, "error": repr(exc)})
@@ -281,7 +285,9 @@ def train(config: dict[str, Any], run_dir: Path, *, resume: str | None, max_step
         advantages = standardize_group_rewards(
             rewards,
             epsilon=float(config["tempflow"].get("advantage_epsilon", 1.0e-6)),
-            zero_std_threshold=float(config["tempflow"].get("zero_std_threshold", 1.0e-8)),
+            zero_std_threshold=float(config.get("reward_fusion", {}).get(
+                "psnr_min_group_std_db", config["tempflow"].get("zero_std_threshold", 1.0e-8)
+            )),
         )
         group_row = {
             "attempt": attempts,
@@ -295,8 +301,9 @@ def train(config: dict[str, Any], run_dir: Path, *, resume: str | None, max_step
             group_row["optimizer_update_skipped"] = True
             _jsonl(run_dir / "groups.jsonl", group_row)
             continue
+        advantage_clip = float(config.get("reward_fusion", {}).get("advantage_clip", float("inf")))
         for rollout, advantage in zip(valid_rollouts, advantages.advantages.tolist()):
-            rollout.advantage = float(advantage)
+            rollout.advantage = float(max(-advantage_clip, min(advantage_clip, advantage)))
             (rollout.seed_dir / "rollout.json").write_text(
                 json.dumps(rollout.metadata(), ensure_ascii=False, indent=2), encoding="utf-8"
             )

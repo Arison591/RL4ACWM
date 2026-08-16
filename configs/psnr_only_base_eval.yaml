@@ -1,0 +1,3 @@
+base_config: ${TEMPFLOW_STANDALONE_ROOT}/configs/psnr_only_overfit224.yaml
+output_dir: ${TEMPFLOW_OUTPUT_ROOT}/psnr_only_base_eval
+experiment: {name: psnr_only_base_eval, mode: base_eval}

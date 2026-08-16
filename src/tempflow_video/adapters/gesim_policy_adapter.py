@@ -19,6 +19,9 @@ class GESimPolicyAdapter:
             return self.runtime.prepare_condition(*args, **kwargs)
 
     def predict_velocity_or_noise(self, *args, **kwargs):
+        import torch
+        if len(args) >= 2 and not torch.is_tensor(args[1]):
+            args = (args[0], torch.tensor([args[1]], device=args[0].device, dtype=args[0].dtype), *args[2:])
         reference = bool(kwargs.pop("reference", False))
         method = self.velocity_adapter.reference_velocity if reference else self.velocity_adapter.policy_velocity
         return method(*args, **kwargs)

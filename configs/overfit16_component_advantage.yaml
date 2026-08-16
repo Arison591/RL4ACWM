@@ -11,10 +11,11 @@ psnr:
   evaluation_frame_scope: [full, future_only]
 reward_fusion:
   mode: component_advantage
-  lambda_action: 0.5
-  lambda_psnr: 0.5
+  lambda_action: 0.0
+  lambda_psnr: 1.0
   advantage_clip: 1.0
   psnr_min_group_std_db: 0.0002
   action_min_group_std: 0.0001
-training: {max_optimizer_steps: 100, execute_requires_approval: true}
+training: {max_optimizer_steps: 224, execute_requires_approval: true}
+evaluation: {at_groups: [0, 112, 224], samples: 16, generation_seeds: [12345678]}
 logging: {wandb_mode: offline, debug_gradient_terms: true}
