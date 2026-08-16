@@ -89,10 +89,23 @@ def _scheduler_report(config: dict[str, Any]) -> dict[str, Any]:
         normalization=config["tempflow"].get("noise_weight_normalization", "schedule_mean"),
     )
     branchable = [index for index, value in enumerate(raw.tolist()) if value > 0]
-    configured = [int(value) for value in config["tempflow"].get("branch_timesteps", [])]
+    configured_values = config["tempflow"].get("branch_timesteps")
+    if configured_values is None:
+        fraction = float(config["tempflow"].get("timestep_fraction", 0.99))
+        if not 0.0 < fraction <= 1.0:
+            raise ValueError("tempflow.timestep_fraction must lie in (0, 1]")
+        configured = [
+            index
+            for index in range(int(steps * fraction))
+            if index in branchable
+        ]
+    else:
+        configured = [int(value) for value in configured_values]
     invalid = sorted(set(configured).difference(branchable))
     if invalid:
         raise ValueError(f"configured branch timesteps are not valid reverse transitions: {invalid}")
+    if not configured or len(set(configured)) != len(configured):
+        raise ValueError("configured branch timesteps must be non-empty and unique")
     return {
         "reverse_denoise_steps": steps,
         "edm_sigmas": sigmas.tolist(),
@@ -100,7 +113,7 @@ def _scheduler_report(config: dict[str, Any]) -> dict[str, Any]:
         "raw_transition_noise": raw.tolist(),
         "noise_weights": weights.tolist(),
         "branchable_timesteps": branchable,
-        "configured_branch_timesteps": configured,
+        "selected_branch_timesteps": configured,
         "terminal_duplicate_noop": bool(times[-1] == times[-2]),
     }
 

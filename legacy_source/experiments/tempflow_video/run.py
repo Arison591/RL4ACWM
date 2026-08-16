@@ -221,10 +221,213 @@ def train(config: dict[str, Any], run_dir: Path, *, resume: str | None, max_step
     )
     target_steps = int(max_steps or config.get("training", {}).get("max_optimizer_steps", config["max_optimizer_steps"]))
     branches = int(config["tempflow"]["branch_factor"])
-    timesteps = [int(value) for value in config["tempflow"]["branch_timesteps"]]
     initial_seed = int(config["tempflow"]["initial_seed"])
     noise_seed_base = int(config["tempflow"]["branch_noise_seed_base"])
     checkpoint_every = int(config["training"].get("checkpoint_every", 1))
+
+    if branching:
+        configured_timesteps = config["tempflow"].get("branch_timesteps")
+        timesteps = sampler.resolve_branch_timesteps(
+            configured=None
+            if configured_timesteps is None
+            else [int(value) for value in configured_timesteps],
+            timestep_fraction=float(config["tempflow"].get("timestep_fraction", 0.99)),
+        )
+        minibatches_per_epoch = int(
+            config["training"].get("optimizer_minibatches_per_rollout_epoch", 2)
+        )
+        num_inner_epochs = int(config["training"].get("num_inner_epochs", 1))
+        shuffle_buffer = bool(config["training"].get("shuffle_rollout_buffer", True))
+        max_rollout_epochs = int(
+            config["training"].get("max_rollout_epochs", max(target_steps * 4, target_steps + 2))
+        )
+        while trainer.optimizer_step < target_steps and trainer.rollout_epoch < max_rollout_epochs:
+            collection_epoch = trainer.rollout_epoch
+            collection_policy_version = trainer.policy_version
+            condition_index = collection_epoch % len(dataset)
+            raw = dataset[condition_index]
+            prepared = runtime.prepare_condition(raw)
+            torch.cuda.reset_peak_memory_stats()
+            started = time.monotonic()
+            common_sampling = {
+                "output_dir": run_dir,
+                "prompt": DEFAULT_PROMPT,
+                "prompt_id": "default",
+                "reward_config_sha256": reward.config_sha256,
+                "video_length": int(config["rollout"]["total_frames"]),
+            }
+            # Official TempFlow constructs one deterministic ODE path and
+            # branches every selected k before changing theta_old.
+            base_artifact = sampler.sample_base(
+                prepared,
+                initial_seed=initial_seed,
+                output_dir=run_dir,
+                prompt=DEFAULT_PROMPT,
+            )
+            rollout_buffer = []
+            rollout_group_rows = []
+            for timestep_position, branch_timestep in enumerate(timesteps):
+                seeds = [
+                    noise_seed_base
+                    + collection_epoch * len(timesteps) * branches
+                    + timestep_position * branches
+                    + offset
+                    for offset in range(branches)
+                ]
+                _, rollouts = sampler.sample_group(
+                    prepared,
+                    initial_seed=initial_seed,
+                    branch_timestep=branch_timestep,
+                    branch_noise_seeds=seeds,
+                    base_artifact=base_artifact,
+                    **common_sampling,
+                )
+                rewards = []
+                valid_rollouts = []
+                for rollout in rollouts:
+                    try:
+                        result = reward.score_rollout(rollout, prep_dir=raw.sample_dir)
+                        if config.get("reward_fusion", {}).get("mode") == "psnr_only_raw_db":
+                            training_reward = float(
+                                result["geometry"]["metrics"]["balanced_psnr_db"]
+                            )
+                        else:
+                            training_reward = float(result["total_reward"])
+                        if not math.isfinite(training_reward):
+                            raise FloatingPointError("terminal training reward is non-finite")
+                        rollout.reward["training_reward"] = training_reward
+                        rewards.append(training_reward)
+                        valid_rollouts.append(rollout)
+                    except Exception as exc:
+                        _jsonl(
+                            run_dir / "invalid_rollouts.jsonl",
+                            {"sample_id": rollout.sample_id, "error": repr(exc)},
+                        )
+                minimum = int(config["reward"].get("min_valid_seeds_per_group", 2))
+                trainer.group_attempts += 1
+                if len(valid_rollouts) < minimum:
+                    raise RuntimeError(
+                        f"valid reward branches {len(valid_rollouts)} < required {minimum}; "
+                        "refusing an invalid group"
+                    )
+                advantages = standardize_group_rewards(
+                    rewards,
+                    epsilon=float(config["tempflow"].get("advantage_epsilon", 1.0e-6)),
+                    zero_std_threshold=float(
+                        config.get("reward_fusion", {}).get(
+                            "psnr_min_group_std_db",
+                            config["tempflow"].get("zero_std_threshold", 1.0e-8),
+                        )
+                    ),
+                )
+                group_row = {
+                    "rollout_epoch": collection_epoch,
+                    "group_attempt": trainer.group_attempts,
+                    "condition_id": raw.condition_id,
+                    "branch_timestep": branch_timestep,
+                    "flow_time": float(valid_rollouts[0].flow_time),
+                    "next_flow_time": float(valid_rollouts[0].next_flow_time),
+                    "collection_policy_version": collection_policy_version,
+                    **advantages.metrics(),
+                }
+                if advantages.zero_std:
+                    group_row["excluded_from_optimizer"] = True
+                    _jsonl(run_dir / "rollout_groups.jsonl", group_row)
+                    rollout_group_rows.append(group_row)
+                    continue
+                advantage_clip = float(
+                    config.get("reward_fusion", {}).get("advantage_clip", float("inf"))
+                )
+                for rollout, advantage in zip(
+                    valid_rollouts, advantages.advantages.tolist()
+                ):
+                    rollout.advantage = float(
+                        max(-advantage_clip, min(advantage_clip, advantage))
+                    )
+                    (rollout.seed_dir / "rollout.json").write_text(
+                        json.dumps(rollout.metadata(), ensure_ascii=False, indent=2),
+                        encoding="utf-8",
+                    )
+                group_row["excluded_from_optimizer"] = False
+                _jsonl(run_dir / "rollout_groups.jsonl", group_row)
+                rollout_group_rows.append(group_row)
+                rollout_buffer.append(valid_rollouts)
+
+            if not rollout_buffer:
+                trainer.rollout_epoch += 1
+                continue
+            optimizer_step_before_buffer = trainer.optimizer_step
+            remaining_updates = target_steps - trainer.optimizer_step
+            records = trainer.update_rollout_buffer(
+                rollout_buffer,
+                minibatches_per_epoch=minibatches_per_epoch,
+                num_inner_epochs=num_inner_epochs,
+                shuffle=shuffle_buffer,
+                seed=int(config.get("seed", 0)) + collection_epoch,
+                max_updates=remaining_updates,
+            )
+            trainer.rollout_epoch += 1
+            runtime.set_policy_version(trainer.policy_version)
+            for minibatch_index, record in enumerate(records):
+                step_row = {
+                    "rollout_epoch": collection_epoch,
+                    "minibatch_index": minibatch_index,
+                    "collection_policy_version": collection_policy_version,
+                    "num_collected_timestep_groups": len(rollout_group_rows),
+                    "num_trained_timestep_groups": len(rollout_buffer),
+                    "selected_branch_timesteps": timesteps,
+                    "elapsed_seconds_total": time.monotonic() - started,
+                    "peak_cuda_allocated_bytes": torch.cuda.max_memory_allocated(),
+                    "peak_cuda_reserved_bytes": torch.cuda.max_memory_reserved(),
+                    **record.to_dict(),
+                }
+                _jsonl(run_dir / "optimizer_steps.jsonl", step_row)
+                print(json.dumps(step_row, ensure_ascii=False, default=str), flush=True)
+
+            checkpoint_due = (
+                trainer.optimizer_step // checkpoint_every
+                > optimizer_step_before_buffer // checkpoint_every
+            )
+            if checkpoint_due or trainer.optimizer_step == target_steps:
+                save_tempflow_checkpoint(
+                    run_dir / "checkpoints",
+                    step=trainer.optimizer_step,
+                    policy=runtime.transformer,
+                    optimizer=trainer.optimizer,
+                    lr_scheduler=trainer.lr_scheduler,
+                    trainer_state=trainer.state_dict(),
+                    config=config,
+                )
+            eval_every = int(config.get("evaluation", {}).get("every_optimizer_steps", 0) or 0)
+            if (
+                not bool(config.get("sampling", {}).get("smoke_only", False))
+                and eval_every > 0
+                and trainer.optimizer_step // eval_every
+                > optimizer_step_before_buffer // eval_every
+            ):
+                summary = evaluate_policy(
+                    runtime,
+                    dataset,
+                    reward,
+                    run_dir=run_dir,
+                    seeds=[
+                        int(seed)
+                        for seed in config["evaluation"].get(
+                            "fixed_generation_seeds", [12345678]
+                        )
+                    ],
+                    max_conditions=int(config["evaluation"].get("fixed_samples", 16)),
+                    tag=f"policy_{runtime.policy_version:08d}",
+                )
+                _jsonl(run_dir / "evaluation_history.jsonl", summary)
+        if trainer.optimizer_step < target_steps:
+            raise RuntimeError(
+                f"only completed {trainer.optimizer_step}/{target_steps} optimizer steps after "
+                f"{trainer.rollout_epoch} rollout epochs"
+            )
+        return
+
+    timesteps = [int(value) for value in config["tempflow"].get("branch_timesteps", ())]
     attempts = trainer.group_attempts
     max_attempts = max(target_steps * 4, target_steps + 2)
     while trainer.optimizer_step < target_steps and attempts < max_attempts:
@@ -271,6 +474,7 @@ def train(config: dict[str, Any], run_dir: Path, *, resume: str | None, max_step
                     training_reward = float(result["total_reward"])
                 if not math.isfinite(training_reward):
                     raise FloatingPointError("terminal training reward is non-finite")
+                rollout.reward["training_reward"] = training_reward
                 rewards.append(training_reward)
                 valid_rollouts.append(rollout)
             except Exception as exc:

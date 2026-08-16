@@ -1,6 +1,8 @@
 base_config: ${AWM_UPSTREAM_ROOT}/configs/awm_coca_train.yaml
 output_dir: ${TEMPFLOW_OUTPUT_ROOT}/psnr_only_overfit224
-max_optimizer_steps: 224
+# Historical filename: 224 now denotes 16 conditions x 14 timestep groups.
+# Two optimizer minibatches are applied per frozen-policy rollout epoch.
+max_optimizer_steps: 32
 seed: 42
 experiment: {name: psnr_only_overfit224, mode: tempflow_full}
 dataset:
@@ -42,27 +44,36 @@ reward:
   min_valid_seeds_per_group: 2
   time_alignment_protocol: legacy_frame_index_truncate
 tempflow:
+  collection_mode: frozen_policy_timestep_buffer
   eta: 0.7
   branch_factor: 6
-  branch_timesteps: [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13]
+  # Match the official TempFlow prefix rule: int(15 * 0.99) = 14,
+  # hence k=0..13. Zero-length terminal scheduler pairs are always rejected.
+  timestep_fraction: 0.99
   initial_seed: 123456
   branch_noise_seed_base: 910000
   advantage_epsilon: 1.0e-6
   noise_weight_normalization: schedule_mean
 optimizer:
-  learning_rate: 1.0e-6
+  learning_rate: 1.0e-5
   clip_range: 1.0e-4
-  reference_kl_beta: 0.01
+  reference_kl_beta: 0.5
   warmup_steps: 10
   log_term_grad_norm: true
 reward_fusion:
   mode: psnr_only_raw_db
   lambda_action: 0.0
   lambda_psnr: 1.0
-  advantage_clip: 1.0
+  advantage_clip: 5.0
   psnr_min_group_std_db: 0.0002
-training: {max_optimizer_steps: 224, checkpoint_every: 112, mixed_precision: bf16}
+training:
+  max_optimizer_steps: 32
+  max_rollout_epochs: 32
+  optimizer_minibatches_per_rollout_epoch: 2
+  num_inner_epochs: 1
+  shuffle_rollout_buffer: true
+  checkpoint_every: 16
+  mixed_precision: bf16
 sampling: {fixed_seed: true, reduced_sampling_steps: false, smoke_only: false}
-evaluation: {fixed_samples: 16, fixed_generation_seeds: [12345678], every_optimizer_steps: 112}
+evaluation: {fixed_samples: 16, fixed_generation_seeds: [12345678], every_optimizer_steps: 16}
 logging: {wandb_mode: offline}
-

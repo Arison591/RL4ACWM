@@ -1,3 +1,5 @@
+from types import SimpleNamespace
+
 import pytest
 import torch
 
@@ -7,6 +9,7 @@ from experiments.tempflow_video.dynamics import (
     edm_transition_mean,
     noise_aware_weights,
 )
+from experiments.tempflow_video.sampler import TempFlowBranchSampler
 
 
 def test_branches_share_state_but_use_distinct_noise():
@@ -107,3 +110,16 @@ def test_noise_aware_weights_derive_from_noise_schedule_not_step_index():
         noise_aware_weights(times, eta=0.7, enabled=False),
         torch.ones(3, dtype=torch.float64),
     )
+
+
+def test_official_timestep_fraction_selects_first_14_of_15_and_rejects_noop():
+    flow_times = torch.linspace(0.95, 0.05, 15, dtype=torch.float64).tolist()
+    flow_times.append(flow_times[-1])  # GE-Sim duplicate terminal sigma
+    edm_sigmas = torch.tensor([time / (1.0 - time) for time in flow_times])
+    sampler = TempFlowBranchSampler.__new__(TempFlowBranchSampler)
+    sampler.runtime = SimpleNamespace(scheduler=SimpleNamespace(sigmas=edm_sigmas))
+
+    assert sampler.resolve_branch_timesteps(timestep_fraction=0.99) == list(range(14))
+    assert sampler.resolve_branch_timesteps(timestep_fraction=1.0) == list(range(14))
+    with pytest.raises(ValueError, match="zero/non-reverse"):
+        sampler.resolve_branch_timesteps(configured=[14])

@@ -79,6 +79,10 @@ def load_tempflow_config(path: str | Path) -> dict[str, Any]:
     tempflow["enabled"] = train
     tempflow["trajectory_branching"] = branching
     tempflow["noise_aware_weighting"] = weighting
+    if branching:
+        # Persist this semantic version in effective configs/checkpoints so a
+        # pre-buffer immediate-update checkpoint cannot be resumed silently.
+        tempflow.setdefault("collection_mode", "frozen_policy_timestep_buffer")
 
     path_fields = [
         (config, "output_dir"),

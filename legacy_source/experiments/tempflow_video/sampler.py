@@ -82,6 +82,61 @@ class TempFlowBranchSampler:
         sigmas = torch.as_tensor(self.runtime.scheduler.sigmas, dtype=torch.float64).flatten()
         return [float((sigma / (sigma + 1.0)).item()) for sigma in sigmas]
 
+    def sample_base(
+        self,
+        prepared: PreparedGeSimCondition,
+        *,
+        initial_seed: int,
+        output_dir: str | Path,
+        prompt: str,
+    ):
+        """Collect one deterministic ODE path for all timestep branches."""
+
+        return self.trajectory_sampler.sample_base(
+            prepared,
+            initial_seed=initial_seed,
+            output_dir=Path(output_dir) / "base_trajectories",
+            prompt=prompt,
+        )
+
+    def resolve_branch_timesteps(
+        self,
+        *,
+        configured: Sequence[int] | None = None,
+        timestep_fraction: float = 0.99,
+    ) -> list[int]:
+        """Resolve the official prefix-of-schedule timestep selection.
+
+        TempFlow trains ``int(num_steps * timestep_fraction)`` leading steps
+        and its per-step sampler omits the final scheduler transition.  GE-Sim
+        additionally carries a duplicate terminal sigma; zero-length pairs are
+        never legal SDE actions.
+        """
+
+        flow_times = self._flow_times()
+        num_steps = len(flow_times) - 1
+        if configured is not None:
+            selected = [int(value) for value in configured]
+        else:
+            fraction = float(timestep_fraction)
+            if not 0.0 < fraction <= 1.0:
+                raise ValueError("timestep_fraction must lie in (0, 1]")
+            selected = [
+                index
+                for index in range(int(num_steps * fraction))
+                if flow_times[index + 1] < flow_times[index]
+            ]
+        if not selected or len(set(selected)) != len(selected):
+            raise ValueError("branch timesteps must be non-empty and unique")
+        for index in selected:
+            if not 0 <= index < num_steps:
+                raise ValueError(f"branch timestep {index} lies outside [0, {num_steps - 1}]")
+            if not flow_times[index + 1] < flow_times[index]:
+                raise ValueError(
+                    f"branch timestep {index} is a zero/non-reverse scheduler transition"
+                )
+        return selected
+
     @torch.inference_mode()
     def sample_group(
         self,
@@ -95,15 +150,18 @@ class TempFlowBranchSampler:
         prompt_id: str,
         reward_config_sha256: str,
         video_length: int = 29,
+        base_artifact=None,
     ) -> tuple[Path, list[BranchRollout]]:
         if len(branch_noise_seeds) < 2 or len(set(map(int, branch_noise_seeds))) != len(branch_noise_seeds):
             raise ValueError("branch group requires at least two unique branch noise seeds")
-        base = self.trajectory_sampler.sample_base(
-            prepared,
-            initial_seed=initial_seed,
-            output_dir=Path(output_dir) / "base_trajectories",
-            prompt=prompt,
-        )
+        base = base_artifact
+        if base is None:
+            base = self.sample_base(
+                prepared,
+                initial_seed=initial_seed,
+                output_dir=output_dir,
+                prompt=prompt,
+            )
         flow_times = self._flow_times()
         num_steps = len(base.trajectory) - 1
         if len(flow_times) != num_steps + 1:
