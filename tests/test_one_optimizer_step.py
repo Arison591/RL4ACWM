@@ -6,6 +6,8 @@ from tempflow_video.core.trainer import optimizer_step
 
 def test_one_optimizer_step_has_psnr_gradient():
     model = torch.nn.Linear(1, 2, bias=False)
+    with torch.no_grad():
+        model.weight.zero_()  # ratio=1: test the differentiable PPO region deterministically
     x = torch.ones(1, 1)
     logits = model(x).flatten()
     loss = component_policy_objective(log_probs=logits, old_log_probs=torch.zeros(2),

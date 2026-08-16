@@ -4,12 +4,16 @@ import sys
 from pathlib import Path
 
 import torch
+import pytest
 
 from tempflow_video.core import transitions as new
 
 
 def _old_module():
-    root = Path(os.environ["ORIGINAL_REPO_ROOT"])
+    value = os.environ.get("ORIGINAL_REPO_ROOT")
+    if not value:
+        pytest.skip("ORIGINAL_REPO_ROOT not configured")
+    root = Path(value)
     spec = importlib.util.spec_from_file_location("legacy_dynamics", root / "experiments/tempflow_video/dynamics.py")
     module = importlib.util.module_from_spec(spec)
     sys.modules[spec.name] = module
