@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import math
 from dataclasses import dataclass
-from typing import Iterable, Sequence
+from typing import Callable, Iterable, Sequence
 
 import torch
 
@@ -49,10 +49,12 @@ class TempFlowVideoTrainer:
         policy: VideoPolicyAdapter,
         reference: ReferencePolicyAdapter,
         config: TempFlowOptimizerConfig,
+        gradient_reducer: Callable[[Sequence[torch.Tensor]], None] | None = None,
     ) -> None:
         self.policy = policy
         self.reference = reference
         self.config = config
+        self.gradient_reducer = gradient_reducer
         self.parameters = policy.get_trainable_parameters()
         self.optimizer = torch.optim.AdamW(
             self.parameters,
@@ -71,9 +73,16 @@ class TempFlowVideoTrainer:
         self.group_attempts = 0
         self._consumed_groups: set[str] = set()
 
-    def _validate_group(self, rollouts: Sequence[BranchRollout | OrdinaryRollout]) -> str:
-        if len(rollouts) < 2:
-            raise ValueError("TempFlow update requires at least two branch rollouts")
+    def _validate_group(
+        self,
+        rollouts: Sequence[BranchRollout | OrdinaryRollout],
+        *,
+        global_group_size: int,
+    ) -> str:
+        if not rollouts:
+            raise ValueError("every distributed rank needs at least one local branch rollout")
+        if global_group_size < 2 or len(rollouts) > global_group_size:
+            raise ValueError("TempFlow update requires at least two global branch rollouts")
         group_ids = {item.group_key.group_id(item.policy_version) for item in rollouts}
         if len(group_ids) != 1:
             raise ValueError("advantage group mixes incompatible rollout metadata")
@@ -91,14 +100,17 @@ class TempFlowVideoTrainer:
         return group_id
 
     def update_group(
-        self, rollouts: Sequence[BranchRollout | OrdinaryRollout]
+        self,
+        rollouts: Sequence[BranchRollout | OrdinaryRollout],
+        *,
+        global_group_size: int | None = None,
     ) -> TrainerStepRecord:
-        group_id = self._validate_group(rollouts)
+        global_count = int(global_group_size or len(rollouts))
+        group_id = self._validate_group(rollouts, global_group_size=global_count)
         self.reference.assert_unchanged()
         self.policy.policy_model.train()
         trainable_versions = [int(parameter._version) for parameter in self.parameters]
         self.optimizer.zero_grad(set_to_none=True)
-        count = len(rollouts)
         term_buffers = None
         if self.config.log_term_grad_norm:
             term_buffers = {
@@ -108,7 +120,9 @@ class TempFlowVideoTrainer:
         metric_rows: list[dict[str, float]] = []
         for rollout in rollouts:
             actions = rollout.transitions if isinstance(rollout, OrdinaryRollout) else [rollout]
-            action_scale = 1.0 / (count * len(actions))
+            # Every rank contributes its local shard to one global group mean.
+            # The reducer performs SUM, so no extra world-size division belongs here.
+            action_scale = 1.0 / (global_count * len(actions))
             for action in actions:
                 current = action.current_latent.to(self.policy.runtime.device)
                 collected_next = action.next_latent.to(self.policy.runtime.device)
@@ -175,6 +189,17 @@ class TempFlowVideoTrainer:
                     }
                 )
                 metric_rows.append(row)
+
+        if self.gradient_reducer is not None:
+            gradients = []
+            for parameter in self.parameters:
+                if parameter.grad is None:
+                    parameter.grad = torch.zeros_like(parameter)
+                gradients.append(parameter.grad)
+            self.gradient_reducer(gradients)
+            if term_buffers is not None:
+                for buffers in term_buffers.values():
+                    self.gradient_reducer(buffers)
 
         total_grad_norm_before = _gradient_norm(parameter.grad for parameter in self.parameters)
         if not math.isfinite(total_grad_norm_before):
