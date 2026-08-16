@@ -1,0 +1,19 @@
+{
+  "logical_id": "real-generation-and-reward-parity",
+  "generation": {
+    "condition_id": "001_task_327_episode_684757",
+    "seed": 123456,
+    "trajectory_count": 16,
+    "all_trajectory_hashes_equal": true,
+    "all_three_video_hashes_equal": true,
+    "external_report_pair_sha256": "77be3ec26359161a942764d828bb60a733b219e4eb93444e85c48aec5a162f42"
+  },
+  "action_reward": {
+    "saved_real_parity_ok": true,
+    "tolerance": 1e-8,
+    "errors": 0,
+    "fresh_recompute": "SAM completed; stopped before result because ultralytics is absent"
+  },
+  "payload_committed": false
+}
+

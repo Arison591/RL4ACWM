@@ -1,0 +1,73 @@
+base_config: configs/awm_coca_train.yaml
+
+experiment:
+  name: tempflow_video_overfit16_single_gpu
+  mode: tempflow_full
+
+output_dir: ${TEMPFLOW_OUTPUT_ROOT}/overfit16_single_gpu
+max_optimizer_steps: 100
+
+dataset:
+  name: overfit16
+  prep_root: ${TEMPFLOW_DATA_ROOT}/prep
+  ids_file: configs/awm_coca_overfit16_ids.txt
+  include_samples: []
+  exclude_samples: []
+  limit: 0
+  shuffle: false
+  num_workers: 0
+  pin_memory: true
+  persistent_workers: false
+
+model:
+  checkpoint_root: ${TEMPFLOW_ASSET_ROOT}/checkpoints
+  dtype: bf16
+  train_mode: lora
+  gradient_checkpointing: true
+
+reward:
+  gt_video_template: ${TEMPFLOW_DATA_ROOT}/selected_samples/samples/{condition_id}/head_29_frames.mp4
+  gt_video_templates:
+    head: ${TEMPFLOW_DATA_ROOT}/selected_samples/samples/{condition_id}/head_29_frames.mp4
+    hand_left: ${TEMPFLOW_DATA_ROOT}/selected_samples/samples/{condition_id}/hand_left_29_frames.mp4
+    hand_right: ${TEMPFLOW_DATA_ROOT}/selected_samples/samples/{condition_id}/hand_right_29_frames.mp4
+  min_valid_seeds_per_group: 2
+
+tempflow:
+  enabled: true
+  trajectory_branching: true
+  noise_aware_weighting: true
+  eta: 0.7
+  noise_weight_normalization: schedule_mean
+  branch_factor: 6
+  branch_timesteps: [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13]
+  initial_seed: 123456
+  branch_noise_seed_base: 910000
+  advantage_epsilon: 1.0e-6
+  zero_std_threshold: 1.0e-8
+
+optimizer:
+  learning_rate: 1.0e-6
+  clip_range: 1.0e-4
+  reference_kl_beta: 0.01
+  gradient_accumulation_steps: 1
+  warmup_steps: 10
+  log_term_grad_norm: true
+
+training:
+  max_optimizer_steps: 100
+  mixed_precision: bf16
+  checkpoint_every: 10
+
+sampling:
+  fixed_seed: true
+  reduced_sampling_steps: false
+  smoke_only: false
+
+evaluation:
+  fixed_samples: 16
+  fixed_generation_seeds: [12345678]
+  every_optimizer_steps: 10
+
+logging:
+  wandb_mode: offline

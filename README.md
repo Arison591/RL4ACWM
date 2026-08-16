@@ -8,10 +8,13 @@ Standalone TempFlow-GRPO training code for video AWM. The policy implementation 
 The repository supports legacy total-reward normalization for parity and component-wise Action/PSNR
 advantages for new training. Formal training refuses unset component variance thresholds.
 
+The complete pre-extraction research implementation is retained under `legacy_source/` for audit and
+porting reference. The original `RL4ACWM-publish` checkout no longer contains TempFlow directories,
+scripts, tests, tools, or README references.
+
 ```bash
 export AWM_UPSTREAM_ROOT=/path/to/RL4ACWM-upstream-clean
 export AWM_ASSET_ROOT=/path/to/private/assets
 python tools/audit_upstream.py
 pytest
 ```
-

@@ -1,0 +1,43 @@
+base_config: configs/awm_coca_train.yaml
+
+experiment:
+  name: tempflow_video_eval_overfit16
+  mode: base_eval
+
+output_dir: ${TEMPFLOW_OUTPUT_ROOT}/eval_overfit16
+
+dataset:
+  name: overfit16
+  prep_root: ${TEMPFLOW_DATA_ROOT}/prep
+  ids_file: configs/awm_coca_overfit16_ids.txt
+  limit: 0
+  shuffle: false
+  num_workers: 0
+  pin_memory: true
+
+model:
+  checkpoint_root: ${TEMPFLOW_ASSET_ROOT}/checkpoints
+  dtype: bf16
+
+reward:
+  gt_video_template: ${TEMPFLOW_DATA_ROOT}/selected_samples/samples/{condition_id}/head_29_frames.mp4
+  gt_video_templates:
+    head: ${TEMPFLOW_DATA_ROOT}/selected_samples/samples/{condition_id}/head_29_frames.mp4
+    hand_left: ${TEMPFLOW_DATA_ROOT}/selected_samples/samples/{condition_id}/hand_left_29_frames.mp4
+    hand_right: ${TEMPFLOW_DATA_ROOT}/selected_samples/samples/{condition_id}/hand_right_29_frames.mp4
+
+tempflow:
+  enabled: false
+  trajectory_branching: false
+  noise_aware_weighting: false
+  eta: 0.7
+  noise_weight_normalization: schedule_mean
+  branch_factor: 2
+  branch_timesteps: [2]
+
+evaluation:
+  fixed_samples: 16
+  fixed_generation_seeds: [12345678]
+
+logging:
+  wandb_mode: offline

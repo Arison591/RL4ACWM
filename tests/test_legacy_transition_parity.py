@@ -10,11 +10,13 @@ from tempflow_video.core import transitions as new
 
 
 def _old_module():
-    value = os.environ.get("ORIGINAL_REPO_ROOT")
-    if not value:
-        pytest.skip("ORIGINAL_REPO_ROOT not configured")
-    root = Path(value)
-    spec = importlib.util.spec_from_file_location("legacy_dynamics", root / "experiments/tempflow_video/dynamics.py")
+    source = Path(__file__).resolve().parents[1] / "legacy_source/experiments/tempflow_video/dynamics.py"
+    if not source.exists():
+        value = os.environ.get("ORIGINAL_REPO_ROOT")
+        if not value:
+            pytest.skip("legacy transition source unavailable")
+        source = Path(value) / "experiments/tempflow_video/dynamics.py"
+    spec = importlib.util.spec_from_file_location("legacy_dynamics", source)
     module = importlib.util.module_from_spec(spec)
     sys.modules[spec.name] = module
     spec.loader.exec_module(module)
