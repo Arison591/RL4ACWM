@@ -6,6 +6,8 @@ import statistics
 from pathlib import Path
 from typing import Any, Iterable
 
+from experiments.awm_coca.advantage import leave_one_out_advantages
+
 
 # 远端训练交付使用的 W&B 凭据；环境变量 WANDB_API_KEY 仍可覆盖以便轮换。
 _BUNDLED_WANDB_API_KEY = "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"
@@ -45,6 +47,72 @@ def _summary(prefix: str, values: Iterable[Any]) -> dict[str, float]:
     }
 
 
+def _advantage_diagnostics(
+    rewards: Iterable[dict[str, Any]],
+    *,
+    action_weight: float,
+    geometry_weight: float,
+) -> dict[str, float]:
+    """Diagnose per-seed competition between action and geometry LOO advantages."""
+    paired = []
+    for reward in rewards:
+        if reward.get("total_reward") is None or not reward.get("valid", True):
+            continue
+        values = _finite((reward.get("action_reward"), reward.get("geometry_reward")))
+        if len(values) == 2:
+            paired.append((values[0], values[1]))
+    if len(paired) < 2:
+        return {}
+
+    weight_sum = action_weight + geometry_weight
+    if not math.isfinite(weight_sum) or weight_sum <= 0.0:
+        return {}
+    action_weight /= weight_sum
+    geometry_weight /= weight_sum
+
+    _, action_advantages = leave_one_out_advantages([value[0] for value in paired])
+    _, geometry_advantages = leave_one_out_advantages([value[1] for value in paired])
+
+    action_std = statistics.pstdev(action_advantages)
+    geometry_std = statistics.pstdev(geometry_advantages)
+    if action_std > 0.0 and geometry_std > 0.0:
+        correlation = statistics.fmean(
+            (action / action_std) * (geometry / geometry_std)
+            for action, geometry in zip(action_advantages, geometry_advantages)
+        )
+        correlation = max(-1.0, min(1.0, correlation))
+    else:
+        correlation = 0.0
+
+    action_contributions = [action_weight * value for value in action_advantages]
+    geometry_contributions = [geometry_weight * value for value in geometry_advantages]
+    total_advantages = [
+        action + geometry
+        for action, geometry in zip(action_contributions, geometry_contributions)
+    ]
+    flip_rate = statistics.fmean(
+        float(action * total < 0.0)
+        for action, total in zip(action_advantages, total_advantages)
+    )
+    separate_magnitude = sum(
+        abs(action) + abs(geometry)
+        for action, geometry in zip(action_contributions, geometry_contributions)
+    )
+    retained_magnitude = sum(abs(value) for value in total_advantages)
+    cancellation_rate = (
+        1.0 - retained_magnitude / separate_magnitude
+        if separate_magnitude > 0.0 else 0.0
+    )
+
+    return {
+        "advantage/action_std": action_std,
+        "advantage/geometry_std": geometry_std,
+        "advantage/action_geometry_corr": correlation,
+        "advantage/action_flip_rate": flip_rate,
+        "advantage/cancellation_rate": max(0.0, min(1.0, cancellation_rate)),
+    }
+
+
 class WandbMonitor:
     """Rank-0 W&B monitor. Any W&B failure disables only remote logging."""
 
@@ -55,6 +123,17 @@ class WandbMonitor:
         self.video_every = max(int(os.environ.get("WANDB_VIDEO_EVERY", "50")), 0)
         self.video_samples = max(int(os.environ.get("WANDB_VIDEO_SAMPLES", "1")), 0)
         self.status_path = self.output_dir / "logs" / "wandb_run.txt"
+        reward_config = config.get("reward", {})
+        reward_mode = str(reward_config.get("mode", "action")).lower()
+        if reward_mode == "joint":
+            self.action_reward_weight = float(reward_config.get("action_weight", 1.0))
+            self.geometry_reward_weight = float(reward_config.get("geometry_weight", 1.0))
+        elif reward_mode in {"geometry", "psnr"}:
+            self.action_reward_weight = 0.0
+            self.geometry_reward_weight = 1.0
+        else:
+            self.action_reward_weight = 1.0
+            self.geometry_reward_weight = 0.0
         if not enabled:
             return
         self.status_path.parent.mkdir(parents=True, exist_ok=True)
@@ -145,7 +224,8 @@ class WandbMonitor:
             if train_row.get(key) is not None:
                 payload[f"trainer/{key}"] = float(train_row[key])
         for key in (
-            "advantage", "fm_loss", "reference_kl", "weighted_loss", "importance_weight",
+            "advantage", "action_advantage", "geometry_advantage", "fm_loss", "reference_kl",
+            "weighted_loss", "importance_weight",
             "proposal_probability", "noise_time", "noise_level_index",
         ):
             payload.update(_summary(f"train_samples/{key}", (row.get(key) for row in samples)))
@@ -154,6 +234,11 @@ class WandbMonitor:
         payload.update(_summary("reward/total", (row.get("total_reward") for row in rewards)))
         payload.update(_summary("reward/action", (row.get("action_reward") for row in rewards)))
         payload.update(_summary("reward/geometry", (row.get("geometry_reward") for row in rewards)))
+        payload.update(_advantage_diagnostics(
+            rewards,
+            action_weight=self.action_reward_weight,
+            geometry_weight=self.geometry_reward_weight,
+        ))
         payload["reward/valid_fraction"] = statistics.fmean(
             [float(bool(row.get("valid"))) for row in rewards]
         ) if rewards else 0.0

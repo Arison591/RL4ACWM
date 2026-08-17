@@ -6,6 +6,8 @@ from typing import Any, Protocol, Sequence
 import torch
 import torch.nn.functional as F
 
+from experiments.awm_coca.advantage import leave_one_out_advantages
+
 
 @dataclass(frozen=True)
 class ProposalConfig:
@@ -43,6 +45,8 @@ class RolloutTrainingSample:
     advantage: float
     reward: float
     noise_scores: Sequence[float]
+    action_advantage: float | None = None
+    geometry_advantage: float | None = None
 
 
 @dataclass
@@ -54,6 +58,8 @@ class LossRecord:
     proposal_probability: float
     importance_weight: float
     advantage: float
+    action_advantage: float | None
+    geometry_advantage: float | None
     fm_loss: float
     reference_kl: float
     weighted_loss: float
@@ -70,15 +76,6 @@ class VelocityModelAdapter(Protocol):
     def reference_velocity(
         self, noisy_latent: torch.Tensor, noise_time: torch.Tensor, condition: Any
     ) -> torch.Tensor: ...
-
-
-def leave_one_out_advantages(rewards: Sequence[float]) -> tuple[list[float], list[float]]:
-    if len(rewards) < 2:
-        raise ValueError("leave-one-out advantage requires at least two rollouts")
-    total = float(sum(rewards))
-    denominator = len(rewards) - 1
-    baselines = [(total - float(reward)) / denominator for reward in rewards]
-    return baselines, [float(reward) - baseline for reward, baseline in zip(rewards, baselines)]
 
 
 def base_distribution(config: ProposalConfig, *, device: torch.device) -> torch.Tensor:
@@ -184,6 +181,8 @@ def awm_coca_sample_loss(
         proposal_probability=float(probability.item()),
         importance_weight=float(importance.item()),
         advantage=advantage,
+        action_advantage=sample.action_advantage,
+        geometry_advantage=sample.geometry_advantage,
         fm_loss=float(fm_loss.detach().item()),
         reference_kl=float(reference_kl.detach().item()),
         weighted_loss=float(sample_loss.detach().item()),

@@ -1,11 +1,13 @@
 from __future__ import annotations
 
 import json
+import math
 from pathlib import Path
 from typing import Any
 
 import torch
 
+from experiments.awm_coca.advantage import local_leave_one_out_advantages
 from experiments.awm_coca.gesim_adapter import GeSimConditionBatch
 from experiments.awm_coca.training_core import RolloutTrainingSample
 
@@ -32,6 +34,10 @@ def load_fresh_rollout_group(
     expected_group_size: int | None = None,
     expected_policy_version: int | None = None,
     global_rewards: list[float] | None = None,
+    global_action_rewards: list[float] | None = None,
+    global_geometry_rewards: list[float] | None = None,
+    action_weight: float = 0.5,
+    geometry_weight: float = 0.5,
     artifacts: dict[int, Any] | None = None,
 ) -> tuple[str, list[RolloutTrainingSample]]:
     root = Path(group_dir)
@@ -52,7 +58,7 @@ def load_fresh_rollout_group(
         raise ValueError(f"rollout group has {len(directories)} seeds, expected {required_size}")
     if len(directories) < 2:
         raise ValueError("a fresh rollout group needs at least two seed directories")
-    rewards, payloads = [], []
+    rewards, action_rewards, geometry_rewards, payloads = [], [], [], []
     for directory in directories:
         reward = json.loads((directory / "reward.json").read_text(encoding="utf-8"))
         if reward.get("total_reward") is None or not reward.get("valid", True):
@@ -66,6 +72,8 @@ def load_fresh_rollout_group(
             raise ValueError(f"AWM-CoCA V2 supports exactly one rollout chunk, got {chunks}")
         total_reward = reward.get("total_reward")
         rewards.append(float(total_reward))
+        action_rewards.append(float(reward["action_reward"]))
+        geometry_rewards.append(float(reward["geometry_reward"]))
         seed = int(seed_meta["seed"])
         if artifacts is not None:
             artifact = artifacts.get(seed)
@@ -85,17 +93,38 @@ def load_fresh_rollout_group(
     advantage_rewards = rewards if global_rewards is None else [float(value) for value in global_rewards]
     if len(advantage_rewards) < 2:
         raise ValueError("global leave-one-out advantage requires at least two rewards")
-    total_reward = float(sum(advantage_rewards))
-    advantages = [
-        reward - (total_reward - reward) / (len(advantage_rewards) - 1)
-        for reward in rewards
-    ]
+    advantages = local_leave_one_out_advantages(rewards, advantage_rewards)
+    action_advantages: list[float | None] = [None] * len(rewards)
+    geometry_advantages: list[float | None] = [None] * len(rewards)
+    if global_action_rewards is not None and global_geometry_rewards is not None:
+        global_action_rewards = [float(value) for value in global_action_rewards]
+        global_geometry_rewards = [float(value) for value in global_geometry_rewards]
+        if len(global_action_rewards) != len(advantage_rewards) or len(global_geometry_rewards) != len(advantage_rewards):
+            raise ValueError("global action/geometry rewards must match global total rewards")
+        action_advantages = local_leave_one_out_advantages(action_rewards, global_action_rewards)
+        geometry_advantages = local_leave_one_out_advantages(geometry_rewards, global_geometry_rewards)
+        weight_sum = float(action_weight) + float(geometry_weight)
+        if not math.isfinite(weight_sum) or weight_sum <= 0.0:
+            raise ValueError("action_weight + geometry_weight must be finite and positive")
+        normalized_action_weight = float(action_weight) / weight_sum
+        normalized_geometry_weight = float(geometry_weight) / weight_sum
+        combined_advantages = [
+            normalized_action_weight * action + normalized_geometry_weight * geometry
+            for action, geometry in zip(action_advantages, geometry_advantages)
+        ]
+        if not all(math.isclose(combined, total, rel_tol=1e-6, abs_tol=1e-8)
+                   for combined, total in zip(combined_advantages, advantages)):
+            raise ValueError("separate action/geometry advantages do not reproduce total advantage")
+        advantages = combined_advantages
     samples = []
-    for reward, advantage, (directory, credit, latent, condition) in zip(rewards, advantages, payloads):
+    for reward, advantage, action_advantage, geometry_advantage, (directory, credit, latent, condition) in zip(
+        rewards, advantages, action_advantages, geometry_advantages, payloads
+    ):
         scores = [float(row["noise_score"]) for row in credit.get("noise_rows", [])]
         samples.append(RolloutTrainingSample(
             sample_id=directory.name, condition_id=condition_id, policy_version=policy_version,
             clean_latent=latent.detach().to(device), condition=condition, advantage=advantage,
             reward=reward, noise_scores=scores,
+            action_advantage=action_advantage, geometry_advantage=geometry_advantage,
         ))
     return group_id, samples

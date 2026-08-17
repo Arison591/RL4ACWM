@@ -61,7 +61,7 @@ optimizer:
   max_grad_norm: 1.0
   gradient_accumulation_steps: 1
   warmup_steps: 100
-  reference_kl_beta: 0.01
+  reference_kl_beta: 0.25
   # 逐项梯度范数统计（fm 项 / reference-KL 项，wandb: trainer/fm_grad_norm、
   # trainer/kl_grad_norm）。开启时每个样本多一次 autograd.grad（KL 项）用于统计，
   # 主 backward 仍只执行一次。用于判断两项损失梯度是否同量级后再调 reference_kl_beta。
@@ -119,9 +119,9 @@ reward:
   min_valid_seeds_per_group: 8
   # 训练保持三项等权；评估配置中的 0.2/0.1/0.7 是另一套实验假设，校准前不采用。
   action_metric_weights:
-    mean_iou: 0.1
-    af_fdce_ate_norm: 0.7
-    fdce: 0.2
+    mean_iou: 0.0
+    af_fdce_ate_norm: 0.0
+    fdce: 1.0
   af_fdce_ate_norm_scale: 0.2
   fdce_scale: 10.0
   fdce_k: 16

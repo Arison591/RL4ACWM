@@ -941,6 +941,17 @@ def train(config: dict[str, Any], *, resume: str | None = None, device: str = "c
                 if len(valid_seeds) != len(set(valid_seeds)) or not all(seed in all_seeds for seed in valid_seeds):
                     raise RuntimeError("distributed rollout seed gather is incomplete or duplicated")
                 global_rewards = [reward for _, reward in ordered_rewards]
+                valid_global_reward_rows = [
+                    row["reward"] for row in global_rollout_rows
+                    if row["reward"].get("total_reward") is not None
+                    and row["reward"].get("valid", True)
+                ]
+                global_action_rewards = [
+                    float(reward["action_reward"]) for reward in valid_global_reward_rows
+                ]
+                global_geometry_rewards = [
+                    float(reward["geometry_reward"]) for reward in valid_global_reward_rows
+                ]
                 min_valid_seeds = max(2, int(config["reward"].get("min_valid_seeds_per_group", 8)))
                 skip_reason = _group_skip_reason(
                     gathered_rewards, min_valid_seeds=min_valid_seeds
@@ -979,6 +990,10 @@ def train(config: dict[str, Any], *, resume: str | None = None, device: str = "c
                     group_dir, device=runtime.device, expected_group_size=local_group_size,
                     expected_policy_version=version,
                     global_rewards=global_rewards,
+                    global_action_rewards=global_action_rewards,
+                    global_geometry_rewards=global_geometry_rewards,
+                    action_weight=float(config["reward"].get("action_weight", 1.0)),
+                    geometry_weight=float(config["reward"].get("geometry_weight", 1.0)),
                     artifacts=artifacts_by_seed,
                 )
                 if rank == 0:
