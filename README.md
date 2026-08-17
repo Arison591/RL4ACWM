@@ -21,20 +21,20 @@ pytest
 
 ## PSNR-only four-GPU training
 
-The branch `agent/tempflow-psnr-only-4gpu` is a standalone checkout. It does not import or modify an
-`RL4ACWM-publish` worktree. The four-GPU runner forms one global six-branch TempFlow group: ranks 0
-and 1 collect two branches each, ranks 2 and 3 collect one each; rewards are gathered globally,
-PSNR advantages are computed once over all six branches, and LoRA gradients are summed before every
-optimizer step. Only rank 0 writes checkpoints, group logs and fixed16 evaluations.
+The four-GPU runner forms global TempFlow groups from rank-local branch shards. Rewards are gathered
+globally, PSNR advantages are computed once over the complete group, and LoRA gradients are summed
+before every optimizer step. A deterministic prefix is reused across all selected timesteps while
+the old policy stays frozen; only after collection does optimization start. Only rank 0 writes
+checkpoints, group logs and evaluations.
 
-The remote recipe is intentionally PSNR-only. It uses raw future-only PSNR, branch factor 6, the
-existing learning rate/noise weighting/PPO settings, and the agreed `reference_kl_beta: 0.5`.
+The full recipe is intentionally PSNR-only. It uses raw future-only PSNR, branch factor 6,
+`learning_rate: 1e-5`, noise-aware weighting, and `reference_kl_beta: 0.5`.
 Action reward and its tracker dependencies are not initialized.
 
 On a machine with exactly four visible GPUs:
 
 ```bash
-git clone --single-branch --branch agent/tempflow-psnr-only-4gpu \
+git clone --single-branch --branch agent/tempflow-overfit-signal-fix \
   https://github.com/Arison591/RL4ACWM.git RL4ACWM-tempflow-video
 cd RL4ACWM-tempflow-video
 
@@ -52,3 +52,13 @@ existing path. Model assets and datasets remain external.
 The committed implementation has CPU tests for global branch sharding and metric weighting. A true
 four-GPU NCCL smoke must still be run on the destination machine before committing a 224-group job;
 the launcher refuses any visible GPU count other than four.
+
+For the recommended signal-first diagnosis, choose one of the 16 condition IDs and run:
+
+```bash
+export TEMPFLOW_OVERFIT_CONDITION_ID=<condition-id>
+scripts/run_psnr_signal_overfit_4gpu.sh
+```
+
+This uses timestep 2, 12 branches, KL beta 0.01, a 0.005 dB variance floor, two PPO passes per
+frozen-policy group, and train-seed plus held-out-seed evaluation every 10 optimizer steps.

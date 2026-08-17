@@ -173,10 +173,17 @@ def evaluate_policy(
             "seed": artifact.seed,
             "policy_version": runtime.policy_version,
             "reward": result,
+            "training_reward": float(
+                result["geometry"]["metrics"]["balanced_psnr_db"]
+                if runtime.config.get("reward_fusion", {}).get("mode")
+                == "psnr_only_raw_db"
+                else total
+            ),
         }
         _jsonl(target / "rewards.jsonl", row)
         rows.append(row)
     totals = [float(row["reward"]["total_reward"]) for row in rows]
+    training_totals = [float(row["training_reward"]) for row in rows]
     leaf_rows = [_numeric_reward_leaves(row["reward"]) for row in rows]
     common_leaves = set.intersection(*(set(row) for row in leaf_rows)) if leaf_rows else set()
     component_statistics = {
@@ -191,7 +198,7 @@ def evaluate_policy(
     per_seed_statistics = {}
     for seed in seeds:
         seed_totals = [
-            float(row["reward"]["total_reward"])
+            float(row["training_reward"])
             for row in rows
             if int(row["seed"]) == int(seed)
         ]
@@ -211,6 +218,10 @@ def evaluate_policy(
         "reward_std": float(np.std(totals)),
         "reward_min": float(np.min(totals)),
         "reward_max": float(np.max(totals)),
+        "training_reward_mean": float(np.mean(training_totals)),
+        "training_reward_std": float(np.std(training_totals)),
+        "training_reward_min": float(np.min(training_totals)),
+        "training_reward_max": float(np.max(training_totals)),
         "component_statistics": component_statistics,
         "per_seed_statistics": per_seed_statistics,
     }
@@ -284,6 +295,29 @@ def train(
         if distributed.enabled
         else run_dir
     )
+    evaluation_config = config.get("evaluation", {})
+    if (
+        trainer.optimizer_step == 0
+        and bool(evaluation_config.get("evaluate_before_training", False))
+        and not bool(config.get("sampling", {}).get("smoke_only", False))
+    ):
+        if distributed.is_main:
+            baseline = evaluate_policy(
+                runtime,
+                dataset,
+                reward,
+                run_dir=run_dir,
+                seeds=[
+                    int(seed)
+                    for seed in evaluation_config.get(
+                        "fixed_generation_seeds", [12345678]
+                    )
+                ],
+                max_conditions=int(evaluation_config.get("fixed_samples", 16)),
+                tag="policy_00000000_baseline",
+            )
+            _jsonl(run_dir / "evaluation_history.jsonl", baseline)
+        distributed.barrier()
 
     if branching:
         configured_timesteps = config["tempflow"].get("branch_timesteps")
@@ -481,6 +515,7 @@ def train(
                         "parameter_delta_norm",
                         "gradient_cosine_with_previous_step",
                         "gradient_cosine_has_previous_step",
+                        "gradient_cosine_is_defined",
                     },
                 )
                 step_row = {

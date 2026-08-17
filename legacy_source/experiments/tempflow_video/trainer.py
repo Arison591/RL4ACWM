@@ -235,6 +235,7 @@ class TempFlowVideoTrainer:
             raise FloatingPointError("non-finite TempFlow gradient")
         gradient_cosine = 0.0
         has_previous_gradient = 0.0
+        gradient_cosine_is_defined = 0.0
         if self.config.log_gradient_cosine:
             current_gradients = [
                 (torch.zeros_like(parameter) if parameter.grad is None else parameter.grad)
@@ -244,6 +245,7 @@ class TempFlowVideoTrainer:
                 for parameter in self.parameters
             ]
             if self._previous_gradients is not None:
+                has_previous_gradient = 1.0
                 dot = sum(
                     float((current * previous).sum().item())
                     for current, previous in zip(current_gradients, self._previous_gradients)
@@ -252,7 +254,7 @@ class TempFlowVideoTrainer:
                 previous_norm = _gradient_norm(self._previous_gradients)
                 if current_norm > 0.0 and previous_norm > 0.0:
                     gradient_cosine = dot / (current_norm * previous_norm)
-                    has_previous_gradient = 1.0
+                    gradient_cosine_is_defined = 1.0
             self._previous_gradients = current_gradients
         clip_result = torch.nn.utils.clip_grad_norm_(self.parameters, self.config.max_grad_norm)
         if not torch.isfinite(clip_result):
@@ -297,6 +299,7 @@ class TempFlowVideoTrainer:
                 "parameter_delta_norm": math.sqrt(parameter_delta_squared),
                 "gradient_cosine_with_previous_step": float(gradient_cosine),
                 "gradient_cosine_has_previous_step": has_previous_gradient,
+                "gradient_cosine_is_defined": gradient_cosine_is_defined,
             }
         )
         return TrainerStepRecord(

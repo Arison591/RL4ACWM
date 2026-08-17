@@ -32,6 +32,8 @@ def test_real_tempflow_optimizer_step_changes_only_policy(tmp_path):
     assert record.metrics["policy_grad_norm"] > 0.0
     assert record.metrics["total_grad_norm_before_clip"] > 0.0
     assert record.metrics["raw_kl_loss"] == pytest.approx(0.0, abs=1.0e-12)
+    assert record.metrics["parameter_delta_norm"] > 0.0
+    assert record.metrics["changed_trainable_parameter_tensors"] == 1.0
     assert torch.not_equal(policy.policy_model.delta.detach(), initial_delta)
     assert torch.equal(policy.policy_model.base.detach(), initial_base)
     reference.assert_unchanged()
