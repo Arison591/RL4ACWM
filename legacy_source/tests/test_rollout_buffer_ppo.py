@@ -101,3 +101,31 @@ def test_token_ratio_mode_clips_reused_latent_tokens(tmp_path):
         "ratio_mean"
     ] != pytest.approx(1.0)
     assert records[1].metrics["ratio_abs_deviation_p95"] > 1.0e-4
+
+
+def test_four_independent_on_policy_groups_make_exactly_one_update(tmp_path):
+    policy = ToyVideoPolicy()
+    trainer = TempFlowVideoTrainer(
+        policy,
+        ReferencePolicyAdapter(policy),
+        TempFlowOptimizerConfig(learning_rate=0.05, kl_beta=0.0, log_term_grad_norm=False),
+    )
+    groups = []
+    for index in range(4):
+        group = make_toy_rollouts(policy, tmp_path / f"group-{index}")
+        key = replace(
+            group[0].group_key,
+            condition_id=f"condition-{index}",
+            branch_timestep=(2, 6, 10, 2)[index],
+        )
+        for rollout in group:
+            rollout.group_key = key
+        groups.append(group)
+
+    records = trainer.update_rollout_buffer(
+        groups, minibatches_per_epoch=1, num_inner_epochs=1, shuffle=False
+    )
+
+    assert len(records) == 1
+    assert records[0].optimizer_step == 1
+    assert records[0].policy_version == 1

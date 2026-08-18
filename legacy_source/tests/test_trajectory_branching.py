@@ -128,3 +128,18 @@ def test_official_timestep_fraction_selects_first_14_of_15_and_rejects_noop():
     assert sampler.resolve_branch_timesteps(timestep_fraction=1.0) == list(range(14))
     with pytest.raises(ValueError, match="zero/non-reverse"):
         sampler.resolve_branch_timesteps(configured=[14])
+
+
+def test_representative_timestep_fractions_resolve_legal_distinct_transitions():
+    flow_times = torch.linspace(0.95, 0.05, 15, dtype=torch.float64).tolist()
+    flow_times.append(flow_times[-1])
+    sampler = TempFlowBranchSampler.__new__(TempFlowBranchSampler)
+    sampler.runtime = SimpleNamespace(
+        scheduler=SimpleNamespace(sigmas=torch.tensor([time / (1.0 - time) for time in flow_times]))
+    )
+
+    selected = sampler.resolve_branch_timestep_fractions([0.2, 0.5, 0.8])
+
+    assert len(selected) == 3
+    assert selected == sorted(selected)
+    assert all(flow_times[index + 1] < flow_times[index] for index in selected)

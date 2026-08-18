@@ -147,6 +147,27 @@ class TempFlowBranchSampler:
                 )
         return selected
 
+    def resolve_branch_timestep_fractions(self, fractions: Sequence[float]) -> list[int]:
+        """Pick legal reverse transitions nearest requested schedule positions."""
+        flow_times = self._flow_times()
+        legal = self.resolve_branch_timesteps(configured=None, timestep_fraction=1.0)
+        start, end = float(flow_times[0]), float(flow_times[-1])
+        span = start - end
+        if span <= 0.0:
+            raise ValueError("scheduler flow times do not define a reverse interval")
+        selected = []
+        for fraction in fractions:
+            fraction = float(fraction)
+            if not 0.0 < fraction < 1.0:
+                raise ValueError("branch timestep fractions must lie in (0, 1)")
+            selected.append(min(
+                legal,
+                key=lambda index: abs(((start - float(flow_times[index])) / span) - fraction),
+            ))
+        if len(selected) != len(set(selected)):
+            raise ValueError("requested timestep fractions resolved to duplicate transitions")
+        return selected
+
     @torch.inference_mode()
     def sample_group(
         self,

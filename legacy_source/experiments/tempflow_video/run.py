@@ -16,6 +16,7 @@ import torch
 from experiments.awm_coca.condition_dataset import PrepConditionDataset, build_manifest, write_manifest
 from experiments.awm_coca.gesim_runtime import DEFAULT_PROMPT, PersistentGeSimRuntime
 from experiments.tempflow_video.advantage import standardize_group_rewards
+from experiments.tempflow_video.action_advantage import build_action_advantages
 from experiments.tempflow_video.checkpointing import (
     load_tempflow_checkpoint,
     restore_tempflow_checkpoint,
@@ -63,6 +64,110 @@ def _numeric_reward_leaves(value: Any, prefix: str = "reward") -> dict[str, floa
     if isinstance(value, (int, float)) and math.isfinite(float(value)):
         return {prefix: float(value)}
     return {}
+
+
+def _action_component_row(rollout: BranchRollout, training_reward: float) -> dict[str, float | int]:
+    """Serialize the reward leaves required for action-component GRPO.
+
+    These are gathered across ranks before advantages are constructed.  Using
+    the raw command error deliberately avoids the legacy 0..1 display mapping
+    as the command ordering signal.
+    """
+    reward = rollout.reward
+    metrics = reward.get("action_metrics", {})
+    components = reward.get("action_reward_components", {}).get("components", {})
+    command_error = metrics.get("combined_raw_command_error")
+    if command_error is None:
+        raise KeyError("action reward lacks combined_raw_command_error")
+    return {
+        "id": int(rollout.branch_id),
+        "training_reward": float(training_reward),
+        "command_raw_error": float(command_error),
+        "fdce_reward": float(components["fdce"]),
+        "iou_reward": float(components["mean_iou"]),
+        "valid_arms": int(metrics.get("command_valid_arms", 0)),
+        "coverage": float(metrics.get("command_coverage", 0.0)),
+    }
+
+
+def _build_group_advantages(
+    config: dict[str, Any], rows: list[dict[str, float | int]]
+) -> tuple[torch.Tensor | None, dict[str, float], str | None]:
+    """Choose the explicitly enabled action signal or legacy scalar signal."""
+    action_signal = config.get("reward_fusion", {}).get("mode") == "action_component_raw_command"
+    if action_signal:
+        fusion = config["reward_fusion"]
+        noise_floors = fusion.get("action_component_noise_floors")
+        floor_file = fusion.get("action_component_noise_floor_file")
+        if floor_file:
+            payload = json.loads(Path(floor_file).read_text(encoding="utf-8"))
+            noise_floors = payload["recommended_component_noise_floors"]
+        if not isinstance(noise_floors, dict):
+            raise ValueError("action component advantages require measured noise floors")
+        result = build_action_advantages(
+            command_raw_error=[float(row["command_raw_error"]) for row in rows],
+            fdce_reward=[float(row["fdce_reward"]) for row in rows],
+            iou_reward=[float(row["iou_reward"]) for row in rows],
+            valid_arms=[int(row["valid_arms"]) for row in rows],
+            coverage=[float(row["coverage"]) for row in rows],
+            noise_floors=noise_floors,
+            weights=fusion["action_component_weights"],
+            epsilon=float(config["tempflow"].get("advantage_epsilon", 1.0e-6)),
+        )
+        return result.advantages, result.metrics, result.skip_reason
+    result = standardize_group_rewards(
+        [float(row["training_reward"]) for row in rows],
+        epsilon=float(config["tempflow"].get("advantage_epsilon", 1.0e-6)),
+        zero_std_threshold=float(config.get("reward_fusion", {}).get(
+            "psnr_min_group_std_db", config["tempflow"].get("zero_std_threshold", 1.0e-8)
+        )),
+    )
+    return result.advantages if not result.zero_std else None, result.metrics(), (
+        "zero_std_reward" if result.zero_std else None
+    )
+
+
+def _build_correction_schedule(
+    *, condition_count: int, timesteps: list[int], seed: int
+) -> list[tuple[int, int]]:
+    """Deterministically shuffle the 16x3 grid into balanced four-group windows."""
+    if condition_count != 16 or len(timesteps) != 3:
+        raise ValueError("correction schedule requires 16 conditions and 3 timesteps")
+    all_items = [(condition, timestep) for condition in range(condition_count) for timestep in timesteps]
+    for retry in range(1000):
+        rng = random.Random(int(seed) + retry)
+        remaining = set(all_items)
+        schedule: list[tuple[int, int]] = []
+        while remaining:
+            selected: list[tuple[int, int]] = []
+            used_conditions: set[int] = set()
+            for timestep in rng.sample(timesteps, len(timesteps)):
+                candidates = [item for item in remaining if item[1] == timestep and item[0] not in used_conditions]
+                if not candidates:
+                    break
+                item = rng.choice(candidates)
+                selected.append(item)
+                used_conditions.add(item[0])
+            if len(selected) != 3:
+                break
+            candidates = [item for item in remaining if item[0] not in used_conditions]
+            if not candidates:
+                break
+            selected.append(rng.choice(candidates))
+            rng.shuffle(selected)
+            schedule.extend(selected)
+            remaining.difference_update(selected)
+        if len(schedule) == len(all_items):
+            for start in range(0, len(schedule), 4):
+                window = schedule[start:start + 4]
+                if len({item[0] for item in window}) == 4 and set(timesteps).issubset(
+                    {item[1] for item in window}
+                ):
+                    continue
+                break
+            else:
+                return schedule
+    raise RuntimeError("could not construct a balanced deterministic correction schedule")
 
 
 def _make_manifest(
@@ -321,13 +426,17 @@ def train(
         distributed.barrier()
 
     if branching:
-        configured_timesteps = config["tempflow"].get("branch_timesteps")
-        timesteps = sampler.resolve_branch_timesteps(
-            configured=None
-            if configured_timesteps is None
-            else [int(value) for value in configured_timesteps],
-            timestep_fraction=float(config["tempflow"].get("timestep_fraction", 0.99)),
-        )
+        configured_fractions = config["tempflow"].get("branch_timestep_fractions")
+        if configured_fractions is not None:
+            timesteps = sampler.resolve_branch_timestep_fractions(configured_fractions)
+        else:
+            configured_timesteps = config["tempflow"].get("branch_timesteps")
+            timesteps = sampler.resolve_branch_timesteps(
+                configured=None
+                if configured_timesteps is None
+                else [int(value) for value in configured_timesteps],
+                timestep_fraction=float(config["tempflow"].get("timestep_fraction", 0.99)),
+            )
         minibatches_per_epoch = int(
             config["training"].get("optimizer_minibatches_per_rollout_epoch", 2)
         )
@@ -336,10 +445,33 @@ def train(
         max_rollout_epochs = int(
             config["training"].get("max_rollout_epochs", max(target_steps * 4, target_steps + 2))
         )
+        correction_mode = bool(config["training"].get("action_four_group_accumulation", False))
+        groups_per_update = int(config["training"].get("groups_per_optimizer_step", 1))
+        if correction_mode:
+            if config.get("reward_fusion", {}).get("mode") != "action_component_raw_command":
+                raise ValueError("action four-group accumulation requires action_component_raw_command")
+            if len(timesteps) != 3 or groups_per_update != 4:
+                raise ValueError("correction mode requires exactly 3 timesteps and 4 groups/update")
+            if num_inner_epochs != 1:
+                raise ValueError("correction mode requires num_inner_epochs=1")
+            correction_schedule = _build_correction_schedule(
+                condition_count=len(dataset),
+                timesteps=timesteps,
+                seed=int(config.get("seed", 0)),
+            )
+        else:
+            correction_schedule = []
+        pending_rollout_buffer: list[list[BranchRollout]] = []
+        pending_global_group_sizes: list[int] = []
+        pending_group_rows: list[dict[str, Any]] = []
+        pending_policy_version: int | None = None
         while trainer.optimizer_step < target_steps and trainer.rollout_epoch < max_rollout_epochs:
             collection_epoch = trainer.rollout_epoch
             collection_policy_version = trainer.policy_version
-            condition_index = collection_epoch % len(dataset)
+            if correction_mode:
+                condition_index, scheduled_timestep = correction_schedule[collection_epoch]
+            else:
+                condition_index, scheduled_timestep = collection_epoch % len(dataset), None
             raw = dataset[condition_index]
             prepared = runtime.prepare_condition(raw)
             torch.cuda.reset_peak_memory_stats()
@@ -359,10 +491,16 @@ def train(
                 output_dir=rank_output,
                 prompt=DEFAULT_PROMPT,
             )
-            rollout_buffer = []
-            global_group_sizes = []
-            rollout_group_rows = []
-            for timestep_position, branch_timestep in enumerate(timesteps):
+            rollout_buffer = pending_rollout_buffer if correction_mode else []
+            global_group_sizes = pending_global_group_sizes if correction_mode else []
+            rollout_group_rows = pending_group_rows if correction_mode else []
+            selected_timesteps = [scheduled_timestep] if correction_mode else timesteps
+            if correction_mode:
+                if pending_policy_version is None:
+                    pending_policy_version = collection_policy_version
+                elif pending_policy_version != collection_policy_version:
+                    raise RuntimeError("four-group buffer mixes policy versions")
+            for timestep_position, branch_timestep in enumerate(selected_timesteps):
                 global_seeds = [
                     noise_seed_base
                     + collection_epoch * len(timesteps) * branches
@@ -411,35 +549,55 @@ def train(
                 minimum = int(config["reward"].get("min_valid_seeds_per_group", 2))
                 trainer.group_attempts += 1
                 local_reward_rows = [
-                    (int(rollout.branch_id), float(value))
+                    _action_component_row(rollout, value)
+                    if config.get("reward_fusion", {}).get("mode") == "action_component_raw_command"
+                    else {"id": int(rollout.branch_id), "training_reward": float(value)}
                     for rollout, value in zip(valid_rollouts, rewards)
                 ]
                 gathered_reward_rows = distributed.gather_objects(local_reward_rows)
                 if any(len(rows) == 0 for rows in gathered_reward_rows):
+                    if correction_mode:
+                        group_row = {
+                            "rollout_epoch": collection_epoch,
+                            "group_attempt": trainer.group_attempts,
+                            "condition_id": raw.condition_id,
+                            "branch_timestep": branch_timestep,
+                            "excluded_from_optimizer": True,
+                            "skip_reason": "reward_scoring_invalid",
+                        }
+                        if distributed.is_main:
+                            _jsonl(run_dir / "rollout_groups.jsonl", group_row)
+                        continue
                     raise RuntimeError(
                         "at least one rank has no valid PSNR branch; refusing desynchronized update"
                     )
                 global_reward_rows = sorted(
                     (row for rows in gathered_reward_rows for row in rows),
-                    key=lambda row: row[0],
+                    key=lambda row: int(row["id"]),
                 )
-                global_ids = [row[0] for row in global_reward_rows]
+                global_ids = [int(row["id"]) for row in global_reward_rows]
                 if len(global_ids) != len(set(global_ids)):
                     raise RuntimeError("distributed branch shards contain duplicate global branch IDs")
                 if len(global_reward_rows) < minimum:
+                    if correction_mode:
+                        group_row = {
+                            "rollout_epoch": collection_epoch,
+                            "group_attempt": trainer.group_attempts,
+                            "condition_id": raw.condition_id,
+                            "branch_timestep": branch_timestep,
+                            "valid_branches": len(global_reward_rows),
+                            "excluded_from_optimizer": True,
+                            "skip_reason": "insufficient_valid_branches",
+                        }
+                        if distributed.is_main:
+                            _jsonl(run_dir / "rollout_groups.jsonl", group_row)
+                        continue
                     raise RuntimeError(
                         f"valid reward branches {len(global_reward_rows)} < required {minimum}; "
                         "refusing an invalid group"
                     )
-                advantages = standardize_group_rewards(
-                    [row[1] for row in global_reward_rows],
-                    epsilon=float(config["tempflow"].get("advantage_epsilon", 1.0e-6)),
-                    zero_std_threshold=float(
-                        config.get("reward_fusion", {}).get(
-                            "psnr_min_group_std_db",
-                            config["tempflow"].get("zero_std_threshold", 1.0e-8),
-                        )
-                    ),
+                advantages, advantage_metrics, skip_reason = _build_group_advantages(
+                    config, global_reward_rows
                 )
                 group_row = {
                     "rollout_epoch": collection_epoch,
@@ -451,18 +609,21 @@ def train(
                     "collection_policy_version": collection_policy_version,
                     "world_size": distributed.world_size,
                     "branches_per_rank": [len(rows) for rows in gathered_reward_rows],
-                    **advantages.metrics(),
+                    **advantage_metrics,
                 }
-                if advantages.zero_std:
+                if advantages is None:
                     group_row["excluded_from_optimizer"] = True
+                    group_row["skip_reason"] = skip_reason
                     if distributed.is_main:
                         _jsonl(run_dir / "rollout_groups.jsonl", group_row)
                     rollout_group_rows.append(group_row)
                     continue
-                advantage_clip = float(
-                    config.get("reward_fusion", {}).get("advantage_clip", float("inf"))
+                advantage_clip = (
+                    float("inf")
+                    if config.get("reward_fusion", {}).get("mode") == "action_component_raw_command"
+                    else float(config.get("reward_fusion", {}).get("advantage_clip", float("inf")))
                 )
-                advantage_by_id = dict(zip(global_ids, advantages.advantages.tolist()))
+                advantage_by_id = dict(zip(global_ids, advantages.tolist()))
                 for rollout in valid_rollouts:
                     advantage = advantage_by_id[int(rollout.branch_id)]
                     rollout.advantage = float(
@@ -482,11 +643,16 @@ def train(
             if not rollout_buffer:
                 trainer.rollout_epoch += 1
                 continue
+            if correction_mode and len(rollout_buffer) < groups_per_update:
+                trainer.rollout_epoch += 1
+                continue
+            if correction_mode and len(rollout_buffer) != groups_per_update:
+                raise RuntimeError("correction mode collected an unexpected number of groups")
             optimizer_step_before_buffer = trainer.optimizer_step
             remaining_updates = target_steps - trainer.optimizer_step
             records = trainer.update_rollout_buffer(
                 rollout_buffer,
-                minibatches_per_epoch=minibatches_per_epoch,
+                minibatches_per_epoch=1 if correction_mode else minibatches_per_epoch,
                 num_inner_epochs=num_inner_epochs,
                 shuffle=shuffle_buffer,
                 seed=int(config.get("seed", 0)) + collection_epoch,
@@ -525,7 +691,10 @@ def train(
                     "collection_policy_version": collection_policy_version,
                     "num_collected_timestep_groups": len(rollout_group_rows),
                     "num_trained_timestep_groups": len(rollout_buffer),
-                    "selected_branch_timesteps": timesteps,
+                    "selected_branch_timesteps": selected_timesteps if not correction_mode else [
+                        int(row["branch_timestep"]) for row in rollout_group_rows
+                    ],
+                    "groups_accumulated_per_optimizer_step": len(rollout_buffer),
                     "elapsed_seconds_total": time.monotonic() - started,
                     "peak_cuda_allocated_bytes": torch.cuda.max_memory_allocated(),
                     "peak_cuda_reserved_bytes": torch.cuda.max_memory_reserved(),
@@ -535,6 +704,12 @@ def train(
                 if distributed.is_main:
                     _jsonl(run_dir / "optimizer_steps.jsonl", step_row)
                     print(json.dumps(step_row, ensure_ascii=False, default=str), flush=True)
+
+            if correction_mode:
+                pending_rollout_buffer.clear()
+                pending_global_group_sizes.clear()
+                pending_group_rows.clear()
+                pending_policy_version = None
 
             checkpoint_due = (
                 trainer.optimizer_step // checkpoint_every
