@@ -51,6 +51,11 @@ def main() -> None:
     parser.add_argument("--output-dir", required=True)
     parser.add_argument("--repeats", type=int, default=3)
     parser.add_argument("--limit", type=int, default=48)
+    parser.add_argument(
+        "--distinct-conditions",
+        action="store_true",
+        help="Select at most one saved rollout per condition before worker sharding.",
+    )
     parser.add_argument("--offset", type=int, default=0)
     parser.add_argument("--stride", type=int, default=1)
     parser.add_argument("--worker-id", type=int, default=None)
@@ -60,7 +65,22 @@ def main() -> None:
 
     config = load_tempflow_config(args.config)
     reward = VideoRewardAdapter(config["reward"])
-    all_rollout_paths = sorted(Path(args.saved_run).glob("**/rollout.json"))[: args.limit]
+    all_rollout_paths = sorted(Path(args.saved_run).glob("**/rollout.json"))
+    if args.distinct_conditions:
+        selected = []
+        seen_conditions = set()
+        for rollout_path in all_rollout_paths:
+            metadata = json.loads(rollout_path.read_text(encoding="utf-8"))
+            condition_id = str(metadata["condition_id"])
+            if condition_id in seen_conditions:
+                continue
+            selected.append(rollout_path)
+            seen_conditions.add(condition_id)
+            if len(selected) == args.limit:
+                break
+        all_rollout_paths = selected
+    else:
+        all_rollout_paths = all_rollout_paths[: args.limit]
     rollout_paths = all_rollout_paths[args.offset :: args.stride]
     if not rollout_paths:
         raise FileNotFoundError("no saved rollout.json files found")
