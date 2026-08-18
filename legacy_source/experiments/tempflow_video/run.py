@@ -447,6 +447,9 @@ def train(
         )
         correction_mode = bool(config["training"].get("action_four_group_accumulation", False))
         groups_per_update = int(config["training"].get("groups_per_optimizer_step", 1))
+        max_group_attempts_per_update = int(
+            config["training"].get("max_group_attempts_per_update", 12)
+        )
         if correction_mode:
             if config.get("reward_fusion", {}).get("mode") != "action_component_raw_command":
                 raise ValueError("action four-group accumulation requires action_component_raw_command")
@@ -465,6 +468,7 @@ def train(
         pending_global_group_sizes: list[int] = []
         pending_group_rows: list[dict[str, Any]] = []
         pending_policy_version: int | None = None
+        pending_attempts = 0
         while trainer.optimizer_step < target_steps and trainer.rollout_epoch < max_rollout_epochs:
             collection_epoch = trainer.rollout_epoch
             collection_policy_version = trainer.policy_version
@@ -548,6 +552,8 @@ def train(
                         )
                 minimum = int(config["reward"].get("min_valid_seeds_per_group", 2))
                 trainer.group_attempts += 1
+                if correction_mode:
+                    pending_attempts += 1
                 local_reward_rows = [
                     _action_component_row(rollout, value)
                     if config.get("reward_fusion", {}).get("mode") == "action_component_raw_command"
@@ -642,9 +648,20 @@ def train(
                 global_group_sizes.append(len(global_reward_rows))
 
             if not rollout_buffer:
+                if correction_mode and pending_attempts >= max_group_attempts_per_update:
+                    raise RuntimeError(
+                        "command reward lacks enough learnable signal: collected 0/"
+                        f"{groups_per_update} valid groups after {pending_attempts} attempts"
+                    )
                 trainer.rollout_epoch += 1
                 continue
             if correction_mode and len(rollout_buffer) < groups_per_update:
+                if pending_attempts >= max_group_attempts_per_update:
+                    raise RuntimeError(
+                        "command reward lacks enough learnable signal: collected "
+                        f"{len(rollout_buffer)}/{groups_per_update} valid groups after "
+                        f"{pending_attempts} attempts"
+                    )
                 trainer.rollout_epoch += 1
                 continue
             if correction_mode and len(rollout_buffer) != groups_per_update:
@@ -727,6 +744,7 @@ def train(
                 pending_global_group_sizes.clear()
                 pending_group_rows.clear()
                 pending_policy_version = None
+                pending_attempts = 0
 
             checkpoint_due = (
                 trainer.optimizer_step // checkpoint_every

@@ -42,6 +42,7 @@ training:
   max_rollout_epochs: 48
   action_four_group_accumulation: true
   groups_per_optimizer_step: 4
+  max_group_attempts_per_update: 12
   optimizer_minibatches_per_rollout_epoch: 1
   num_inner_epochs: 1
   shuffle_rollout_buffer: false
