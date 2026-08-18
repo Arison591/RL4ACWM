@@ -25,6 +25,24 @@ def _fmt(value: float | int | None) -> str:
     return "n/a" if value is None else f"{value:.6g}"
 
 
+def _reward_ranges(run_dir: Path) -> dict[str, tuple[float, float]]:
+    values: dict[str, list[float]] = {
+        "combined_raw_command_error": [],
+        "final_command_component": [],
+    }
+    for path in run_dir.glob("distributed/**/reward.json"):
+        payload = json.loads(path.read_text(encoding="utf-8"))
+        metrics = payload.get("action_metrics", {})
+        for key in values:
+            if key in metrics:
+                values[key].append(float(metrics[key]))
+    return {
+        key: (min(items), max(items))
+        for key, items in values.items()
+        if items
+    }
+
+
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--run-dir", required=True)
@@ -39,8 +57,10 @@ def main() -> None:
     gradients = _jsonl(run_dir / "group_gradient_diagnostics.jsonl")
     noise = json.loads(Path(args.noise_floor).read_text(encoding="utf-8"))
     paired = json.loads(Path(args.paired_report).read_text(encoding="utf-8"))
+    ranges = _reward_ranges(run_dir)
     valid = [row for row in groups if not row.get("excluded_from_optimizer", False)]
     invalid = [row for row in groups if row.get("excluded_from_optimizer", False)]
+    valid_initial_seeds = [int(row["initial_seed"]) for row in valid if "initial_seed" in row]
 
     total_groups = len(groups)
     effective_ratio = len(valid) / total_groups if total_groups else 0.0
@@ -83,6 +103,9 @@ def main() -> None:
         "",
         "## Command Dynamic Range And Repeatability",
         "",
+        f"- Observed raw command error range: {_fmt(ranges.get('combined_raw_command_error', (None, None))[0])} to {_fmt(ranges.get('combined_raw_command_error', (None, None))[1])} px.",
+        f"- Observed legacy command component range: {_fmt(ranges.get('final_command_component', (None, None))[0])} to {_fmt(ranges.get('final_command_component', (None, None))[1])}.",
+        "- On the 512x384 action video, the legacy component is linear as `1 - raw_error/128` until its 128-px zero clip; training therefore uses raw error directly to avoid presentation-scale compression.",
         f"- Repeatability sample: {noise['rollouts']} saved rollouts across {noise.get('condition_count', 'n/a')} conditions, {noise['repeats']} scoring repeats each.",
         f"- P95 noise floors: command={_fmt(floors['command'])}, FDCE={_fmt(floors['fdce'])}, IoU={_fmt(floors['iou'])}.",
         "- YOLO tracker is reset before and after every scoring pass; SAM3 state is per-call and CoWTracker is stateless for this path.",
@@ -91,6 +114,7 @@ def main() -> None:
         "",
         "Each high-is-good component is population-z-scored inside its branch group. The final advantage is `0.7 A_command + 0.2 m_fdce A_fdce + 0.1 m_iou A_iou`; no second z-score or advantage clipping is applied. Command validity requires two arms, full coverage, and group standard deviation above its noise floor. Invalid command groups are skipped rather than being driven by FDCE/IoU.",
         f"- Attempts: {total_groups}; valid command groups: {len(valid)} ({effective_ratio:.1%}); skipped: {len(invalid)}.",
+        f"- Valid-group initial seeds logged: {len(valid_initial_seeds)}; unique: {len(set(valid_initial_seeds))}.",
         f"- Mean absolute weighted contribution: command={_fmt(command_contribution)}, FDCE={_fmt(fdce_contribution)}, IoU={_fmt(iou_contribution)}.",
         f"- Mean Spearman with total advantage: command={_fmt(command_rank)}, FDCE={_fmt(fdce_rank)}, IoU={_fmt(iou_rank)}.",
         f"- Command dominated the observed training ranking: {'yes' if command_dominates else 'no'}.",

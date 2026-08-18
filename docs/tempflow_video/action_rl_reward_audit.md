@@ -31,10 +31,10 @@ running baseline effective-config SHA256 is
    `af_fdce_ate_norm = combined_raw_command_error / sqrt(H^2 + W^2)` and
    `final_command_component = 1 - clip(af_fdce_ate_norm / 0.2, 0, 1)`.
 
-For the current 640x480 reward video, the image diagonal is 800 px. The
-legacy mapping is therefore `1 - raw_error_px / 160` until 160 px, followed by
+For the current 512x384 reward video, the image diagonal is 640 px. The
+legacy mapping is therefore `1 - raw_error_px / 128` until 128 px, followed by
 zero clipping. The observed command component range `0.699..0.715` maps to raw
-error about `48.2..45.6 px`: a roughly 2.6 px within-group difference. Thus
+error about `38.5..36.5 px`: a roughly 2.1 px within-group difference. Thus
 the narrow range is not caused by saturation in this range, but raw command
 error itself needs to be the training ranking signal and must be gated against
 the measured evaluator noise floor.
