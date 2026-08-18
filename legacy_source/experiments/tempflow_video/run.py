@@ -94,6 +94,7 @@ def _optimizer_config(config: dict[str, Any]) -> TempFlowOptimizerConfig:
         warmup_steps=int(value.get("warmup_steps", 0)),
         log_term_grad_norm=bool(value.get("log_term_grad_norm", True)),
         log_gradient_cosine=bool(value.get("log_gradient_cosine", False)),
+        ppo_ratio_mode=str(value.get("ppo_ratio_mode", "scalar_mean")),
     )
 
 
@@ -793,7 +794,27 @@ def main() -> None:
     parser.add_argument("--skip-preflight", action="store_true")
     args = parser.parse_args()
     config = load_tempflow_config(args.config)
-    os.environ["AWM_ASSET_ROOT"] = str(Path(config["model"]["checkpoint_root"]).parent)
+    # Source dependencies (SAM3/CoWTracker) and model weights may live in
+    # separate checkouts on the training host.  Preserve an explicitly
+    # configured source root and derive it from the model path only as the
+    # standalone fallback.
+    os.environ.setdefault(
+        "AWM_ASSET_ROOT", str(Path(config["model"]["checkpoint_root"]).parent)
+    )
+    # Action reward assets (SAM3/CoWTracker/YOLO) live beside the GE-Sim
+    # checkpoint, while their source code may come from a separate checkout.
+    os.environ["AWM_MODEL_ROOT"] = str(Path(config["model"]["checkpoint_root"]))
+    if str(config.get("reward", {}).get("mode", "")).lower() in {"action", "joint"}:
+        # SAM3 inspects distributed state while it is constructed.  Build one
+        # rank-local instance before the trainer process group exists; otherwise
+        # rank-0-only fixed evaluation can advance the default NCCL collective
+        # sequence and desynchronize the next training all-gather.
+        local_rank = int(os.environ.get("LOCAL_RANK", "0"))
+        if torch.cuda.is_available():
+            torch.cuda.set_device(local_rank)
+        from experiments.action_following.sam_tracking import get_sam3_video_model
+
+        get_sam3_video_model()
     distributed = DistributedContext.initialize(
         int(config.get("distributed", {}).get("world_size", 1))
     )

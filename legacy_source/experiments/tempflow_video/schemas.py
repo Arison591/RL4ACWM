@@ -49,6 +49,7 @@ class CollectedTransition:
     next_flow_time: float
     eta: float
     old_log_prob: float
+    old_token_log_prob: torch.Tensor
     rf_noise_std: float
     noise_weight: float
     noise_seed: int
@@ -85,6 +86,7 @@ class OrdinaryRollout:
                     "next_flow_time": action.next_flow_time,
                     "eta": action.eta,
                     "old_log_prob": action.old_log_prob,
+                    "old_token_log_prob_shape": list(action.old_token_log_prob.shape),
                     "rf_noise_std": action.rf_noise_std,
                     "noise_weight": action.noise_weight,
                     "noise_seed": action.noise_seed,
@@ -115,6 +117,7 @@ class BranchRollout:
     next_flow_time: float
     eta: float
     old_log_prob: float
+    old_token_log_prob: torch.Tensor
     rf_noise_std: float
     noise_weight: float
     prefix_latent_sha256: str
@@ -138,6 +141,7 @@ class BranchRollout:
             "next_flow_time": self.next_flow_time,
             "eta": self.eta,
             "old_log_prob": self.old_log_prob,
+            "old_token_log_prob_shape": list(self.old_token_log_prob.shape),
             "rf_noise_std": self.rf_noise_std,
             "noise_weight": self.noise_weight,
             "prefix_latent_sha256": self.prefix_latent_sha256,
