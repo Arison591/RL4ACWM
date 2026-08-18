@@ -138,6 +138,10 @@ else
   done
 fi
 
+# 远程数据通常只提供一份 prep；未显式指定评估集时复用训练 prep，
+# 避免配置中的仓库相对路径 output/prep_eval 导致预检失败。
+EVAL_PREP_ROOT="${EVAL_PREP_ROOT:-${PREP_ROOT}}"
+
 # 外部数据盘存在时，checkpoint、rollout 和日志也默认写到数据盘，避免占满 workspace。
 # 新训练每次创建独立 run 目录，防止上一次失败留下的 rollout 与 policy/seed 重名。
 # 断点续训必须显式传入原 OUTPUT_DIR 和 RESUME_CHECKPOINT。
@@ -152,6 +156,12 @@ if [[ -z "${OUTPUT_DIR}" ]]; then
 else
   OUTPUT_DIR="$(resolve_from_repo "${OUTPUT_DIR}")"
   RUN_STAMP="$(date +%Y%m%d_%H%M%S)_$$"
+  # A caller may pass a stable base path.  Never reuse an existing run directory
+  # unless this is an explicit checkpoint resume.
+  if [[ -e "${OUTPUT_DIR}" && -z "${RESUME_CHECKPOINT}" ]]; then
+    OUTPUT_DIR="${OUTPUT_DIR%/}_run_${RUN_STAMP}"
+    echo "[INFO] OUTPUT_DIR 已存在，自动切换到唯一目录: ${OUTPUT_DIR}"
+  fi
 fi
 
 if [[ -n "${RESUME_CHECKPOINT}" && "${OUTPUT_DIR_WAS_SET}" -ne 1 ]]; then
@@ -231,6 +241,7 @@ export DIST_TIMEOUT_SECONDS="${DIST_TIMEOUT_SECONDS:-7200}"
 
 COMMON_ARGS=(
   --prep-root "${PREP_ROOT}"
+  --eval-prep-root "${EVAL_PREP_ROOT}"
   --gt-root "${GT_ROOT}"
   --checkpoint-root "${MODEL_DIR}"
   --output-dir "${OUTPUT_DIR}"
@@ -256,6 +267,6 @@ PYTHON_BIN="${PYTHON_BIN}" "${SCRIPT_DIR}/run_awm_coca.sh" preflight "${COMMON_A
   --effective-config-output "${EFFECTIVE_CONFIG}" \
   "${COMMON_ARGS[@]}" "$@"
 
-echo "[INFO] 单机四卡训练开始：global group=16，每卡 4 条 rollout"
+echo "[INFO] 单机 ${NPROC_PER_NODE} 卡训练开始"
 PYTHON_BIN="${PYTHON_BIN}" NPROC_PER_NODE="${NPROC_PER_NODE}" \
   "${SCRIPT_DIR}/run_awm_coca.sh" train4 "${COMMON_ARGS[@]}" "$@"

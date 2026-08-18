@@ -26,9 +26,17 @@ from PIL import Image
 _PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 if _PROJECT_ROOT not in sys.path:
     sys.path.insert(0, _PROJECT_ROOT)   # 允许以脚本运行时 import experiments.*
-_THIRD_PARTY = f"{_PROJECT_ROOT}/third_party"
-SAM3_SRC = f"{_THIRD_PARTY}/sam3"
-SAM3_CKPT = f"{_PROJECT_ROOT}/checkpoints/sam3.pt"
+# Training checkouts and model assets are separate trees on the cluster.  Keep
+# the repository-local fallback for standalone use, but honor the configured
+# asset root used by the TempFlow runner.
+_ASSET_ROOT = os.environ.get("AWM_ASSET_ROOT", _PROJECT_ROOT)
+_MODEL_ROOT = os.environ.get(
+    "AWM_MODEL_ROOT",
+    os.environ.get("TEMPFLOW_MODEL_ROOT", _ASSET_ROOT),
+)
+_THIRD_PARTY = os.path.join(_ASSET_ROOT, "third_party")
+SAM3_SRC = os.path.join(_THIRD_PARTY, "sam3")
+SAM3_CKPT = os.path.join(_MODEL_ROOT, "sam3.pt")
 
 _sam3_video = None
 _sam3_lock = Lock()

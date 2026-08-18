@@ -27,10 +27,15 @@ import torch
 _PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 if _PROJECT_ROOT not in sys.path:
     sys.path.insert(0, _PROJECT_ROOT)   # 允许以脚本运行时 import experiments.*
-_THIRD_PARTY = f"{_PROJECT_ROOT}/third_party"
-# 权重落在用户指定的 checkpoints/cowtracker/ 目录（setup_cowtracker.sh 下载到该处）。
-COWTRACKER_CKPT = f"{_PROJECT_ROOT}/checkpoints/cowtracker/cowtracker_model.pth"
-COWTRACKER_SRC = f"{_THIRD_PARTY}/cowtracker"
+_ASSET_ROOT = os.environ.get("AWM_ASSET_ROOT", _PROJECT_ROOT)
+_MODEL_ROOT = os.environ.get(
+    "AWM_MODEL_ROOT",
+    os.environ.get("TEMPFLOW_MODEL_ROOT", _ASSET_ROOT),
+)
+_THIRD_PARTY = os.path.join(_ASSET_ROOT, "third_party")
+# Assets are normally mounted outside the source checkout on the training host.
+COWTRACKER_CKPT = os.path.join(_MODEL_ROOT, "cowtracker", "cowtracker_model.pth")
+COWTRACKER_SRC = os.path.join(_THIRD_PARTY, "cowtracker")
 
 MAX_FRAMES = 256        # CoWTracker 单次推理的帧数上限
 VISIBILITY_THRESHOLD = 0.5   # 置信度型 visibility 的阈值（协议默认，见 metrics_fdce._as_visibility）

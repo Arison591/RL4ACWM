@@ -133,6 +133,7 @@ def action_following_metrics(
             "af_ate": np.nan, "af_ate_p95": np.nan, "af_ate_norm": np.nan,
             "af_det_coverage": det_coverage,
             "af_joint_frames": 0, "af_total_frames": T - t_start,
+            "af_frame_indices": [], "af_per_frame_error": [],
         }
 
     errors = np.linalg.norm(traj[valid] - A[valid], axis=1)
@@ -142,6 +143,11 @@ def action_following_metrics(
         "af_det_coverage": det_coverage,
         "af_joint_frames": int(valid.sum()),
         "af_total_frames": T - t_start,
+        # Keep the uncompressed pixel-space errors for reward auditing and
+        # training-time command ranking.  The index list makes missing frames
+        # explicit instead of silently aligning different detector outputs.
+        "af_frame_indices": np.flatnonzero(valid).astype(int).tolist(),
+        "af_per_frame_error": errors.astype(float).tolist(),
     }
     if diag is not None:
         result["af_ate_norm"] = result["af_ate"] / diag

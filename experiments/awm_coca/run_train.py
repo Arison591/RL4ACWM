@@ -949,9 +949,14 @@ def train(config: dict[str, Any], *, resume: str | None = None, device: str = "c
                 global_action_rewards = [
                     float(reward["action_reward"]) for reward in valid_global_reward_rows
                 ]
-                global_geometry_rewards = [
-                    float(reward["geometry_reward"]) for reward in valid_global_reward_rows
-                ]
+                geometry_values = [reward.get("geometry_reward") for reward in valid_global_reward_rows]
+                # Action-only reward mode intentionally has no geometry reward.
+                # Keep the separate-advantage diagnostics optional in that mode.
+                global_geometry_rewards = (
+                    [float(value) for value in geometry_values]
+                    if geometry_values and all(value is not None for value in geometry_values)
+                    else None
+                )
                 min_valid_seeds = max(2, int(config["reward"].get("min_valid_seeds_per_group", 8)))
                 skip_reason = _group_skip_reason(
                     gathered_rewards, min_valid_seeds=min_valid_seeds

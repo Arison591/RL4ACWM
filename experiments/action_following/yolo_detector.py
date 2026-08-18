@@ -16,9 +16,25 @@ import torch
 from ultralytics import YOLO
 
 _PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-YOLO_CKPT = f"{_PROJECT_ROOT}/checkpoints/yoloworld-EWMBench-v0.1.pt"
+_ASSET_ROOT = os.environ.get("AWM_ASSET_ROOT", _PROJECT_ROOT)
+_MODEL_ROOT = os.environ.get(
+    "AWM_MODEL_ROOT",
+    os.environ.get("TEMPFLOW_MODEL_ROOT", _ASSET_ROOT),
+)
+YOLO_CKPT = os.path.join(_MODEL_ROOT, "yoloworld-EWMBench-v0.1.pt")
 
 _yolo = None
+
+
+def reset_eef_detector_state() -> None:
+    """Reset video-local tracker state without unloading the detector weights."""
+    if _yolo is None:
+        return
+    predictor = getattr(_yolo, "predictor", None)
+    for tracker in getattr(predictor, "trackers", ()):
+        reset = getattr(tracker, "reset", None)
+        if callable(reset):
+            reset()
 
 
 def get_eef_detector(ckpt: str | None = None, device: str | None = None) -> YOLO:
@@ -39,7 +55,9 @@ def detect_eef_bbox(frame: np.ndarray, arm: str = "left", conf: float = 0.8):
     model = get_eef_detector()
     want_cls = 0 if arm == "left" else 1
 
-    results = model.track(frame, persist=True, conf=conf)
+    # We select the highest-confidence class box independently per frame;
+    # keeping ByteTrack state cannot improve this score and leaks across videos.
+    results = model.track(frame, persist=False, conf=conf)
     boxes = results[0].boxes
 
     best = None  # (xywh, conf)
@@ -77,15 +95,19 @@ def extract_trajectory(video_frames: np.ndarray, arm: str = "left", conf: float 
         traj: (T,2) float32  [xc, yc]，检测失败帧为 NaN
         valid: (T,) bool
     """
+    reset_eef_detector_state()
     centers, valid = [], []
-    for frame in video_frames:
-        box = detect_eef_bbox(frame, arm=arm, conf=conf)
-        if box is None:
-            centers.append((np.nan, np.nan))
-            valid.append(False)
-        else:
-            centers.append((box[0], box[1]))
-            valid.append(True)
+    try:
+        for frame in video_frames:
+            box = detect_eef_bbox(frame, arm=arm, conf=conf)
+            if box is None:
+                centers.append((np.nan, np.nan))
+                valid.append(False)
+            else:
+                centers.append((box[0], box[1]))
+                valid.append(True)
+    finally:
+        reset_eef_detector_state()
 
     return np.array(centers, dtype=np.float32), np.array(valid, dtype=bool)
 

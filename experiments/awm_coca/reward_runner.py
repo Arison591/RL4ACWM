@@ -7,7 +7,13 @@ import cv2
 import numpy as np
 
 from experiments.action_following.metrics_action_following import compute_all
-from experiments.action_following import cowtracker_tracking, fdce_tracks, metrics_fdce, sam_tracking
+from experiments.action_following import (
+    cowtracker_tracking,
+    fdce_tracks,
+    metrics_fdce,
+    sam_tracking,
+    yolo_detector,
+)
 from experiments.action_following.action_command import action_following_metrics, commanded_trajectory
 from experiments.eval_action_following import _load_video, DEFAULT_ARMS
 from .reward_functions import action_metrics_to_reward, combine_rewards, compute_geometry_reward
@@ -38,6 +44,66 @@ def prepare_video_pair(gt_path: str, pred_path: str, max_frames: int = 49) -> tu
 def _finite_mean(values: list[Any]) -> float | None:
     values = [float(v) for v in values if v is not None and np.isfinite(v)]
     return float(np.mean(values)) if values else None
+
+
+def _arm_specific_action_metrics(
+    pred: np.ndarray,
+    command: dict[str, np.ndarray],
+    *,
+    diag: float,
+) -> list[dict[str, Any]]:
+    """Compare each detector arm track with its matching command trajectory."""
+    metrics = []
+    for arm in DEFAULT_ARMS:
+        try:
+            pred_traj, _ = yolo_detector.track_pred(pred, arm)
+            metrics.append({
+                "arm": arm,
+                **action_following_metrics(pred_traj, command[arm], diag=diag),
+            })
+        except (ValueError, FloatingPointError):
+            continue
+    return metrics
+
+
+def _aggregate_arm_command_metrics(metrics: list[dict[str, Any]]) -> dict[str, Any]:
+    """Expose the exact uncompressed two-arm command error used for ranking."""
+    by_arm = {str(item.get("arm")): item for item in metrics}
+    frame_errors: dict[int, list[float]] = {}
+    for item in metrics:
+        for frame, error in zip(
+            item.get("af_frame_indices", ()), item.get("af_per_frame_error", ())
+        ):
+            if np.isfinite(error):
+                frame_errors.setdefault(int(frame), []).append(float(error))
+    per_frame = {
+        str(frame): float(np.mean(errors)) for frame, errors in sorted(frame_errors.items())
+    }
+    all_errors = [error for errors in frame_errors.values() for error in errors]
+    left = by_arm.get("left", {})
+    right = by_arm.get("right", {})
+    valid_arms = sum(
+        int(np.isfinite(float(item.get("af_ate", np.nan)))) for item in (left, right)
+    )
+    coverage = _finite_mean([
+        left.get("af_det_coverage"), right.get("af_det_coverage")
+    ])
+    arm_errors = [
+        float(item["af_ate"])
+        for item in (left, right)
+        if item.get("af_ate") is not None and np.isfinite(item["af_ate"])
+    ]
+    return {
+        "left_arm_raw_error": left.get("af_ate"),
+        "right_arm_raw_error": right.get("af_ate"),
+        "per_frame_raw_error": per_frame,
+        "combined_raw_command_error": (
+            float(np.mean(all_errors)) if all_errors else _finite_mean(arm_errors)
+        ),
+        "command_valid_arms": valid_arms,
+        "command_coverage": coverage,
+        "command_is_complete": bool(valid_arms == len(DEFAULT_ARMS) and coverage == 1.0),
+    }
 
 
 def _fdce_metrics(
@@ -75,13 +141,14 @@ def _fdce_metrics(
         )
         for arm in DEFAULT_ARMS
     }
-    for arm in DEFAULT_ARMS:
+    # FDCE is a global foreground-motion metric.  Compute it once; the old
+    # implementation repeated the same bundle for left/right and reported it
+    # as two arm scores even though no arm-specific tracks were used.
+    try:
         bundle, meta = fdce_tracks.build_track_bundle(
             masks[0], masks[1], dense_gt, dense_pred, k=k, seed=fdce_seed, max_frames=len(gt)
         )
-        if meta["init_failure"]:
-            continue
-        try:
+        if not meta["init_failure"]:
             result = metrics_fdce.foreground_displacement_chamfer_error(
                 bundle["generated_tracks"], bundle["reference_tracks"],
                 bundle["generated_visibility"], bundle["reference_visibility"],
@@ -90,29 +157,26 @@ def _fdce_metrics(
                 min_common_frames=min_common_frames,
                 return_details=True,
             )
-        except (ValueError, FloatingPointError):
-            # 单条 rollout 跟踪退化（如生成视频里机械臂不可见，轨迹被可见性过滤掉）
-            # 不应让整个 reward / 训练崩溃；跳过该 arm（与 init_failure 同语义）。
-            continue
-        results.append(result.score)
-        try:
-            pred_tracks, pred_visibility = fdce_tracks.sample_tracks(
-                dense_pred, masks[1], k=k, seed=fdce_seed,
-            )
-            with np.errstate(all="ignore"):
-                centroid = np.nanmean(
-                    np.where(pred_visibility[:, :, None], pred_tracks, np.nan), axis=1
-                )
-        except (ValueError, FloatingPointError):
-            continue
-        af_results.append(action_following_metrics(centroid, command[arm], diag=diag))
+            results.append(result.score)
+    except (ValueError, FloatingPointError):
+        # 单条 rollout 跟踪退化（如生成视频里机械臂不可见）不应让训练崩溃。
+        pass
+
+    # Action-following must be arm-specific.  A centroid of the merged
+    # two-arm mask cannot match both command trajectories: it is bounded below
+    # by roughly half the left/right command separation.  YOLO already exposes
+    # stable left/right EEF tracks, so compare each class with its own command.
+    af_results = _arm_specific_action_metrics(pred, command, diag=diag)
+    command_metrics = _aggregate_arm_command_metrics(af_results)
     return {
         "fdce": _finite_mean(results),
         "fdce_valid_arms": len(results),
-        "af_fdce_ate": _finite_mean([item.get("af_ate") for item in af_results]),
+        "af_fdce_valid_arms": len(af_results),
+        "af_fdce_ate": command_metrics["combined_raw_command_error"],
         "af_fdce_ate_norm": _finite_mean([item.get("af_ate_norm") for item in af_results]),
         "af_fdce_det_coverage": _finite_mean([item.get("af_det_coverage") for item in af_results]),
         "af_fdce_joint_frames": _finite_mean([item.get("af_joint_frames") for item in af_results]),
+        **command_metrics,
     }
 
 
@@ -193,6 +257,9 @@ def compute_head_reward(
             metric_weights=action_metric_weights,
             af_fdce_ate_norm_scale=af_fdce_ate_norm_scale,
             fdce_scale=fdce_scale,
+        )
+        action_metrics["final_command_component"] = action_components["components"].get(
+            "af_fdce_ate_norm"
         )
 
     geometry = compute_geometry_reward(

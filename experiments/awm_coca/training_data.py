@@ -73,7 +73,9 @@ def load_fresh_rollout_group(
         total_reward = reward.get("total_reward")
         rewards.append(float(total_reward))
         action_rewards.append(float(reward["action_reward"]))
-        geometry_rewards.append(float(reward["geometry_reward"]))
+        geometry_value = reward.get("geometry_reward")
+        if geometry_value is not None:
+            geometry_rewards.append(float(geometry_value))
         seed = int(seed_meta["seed"])
         if artifacts is not None:
             artifact = artifacts.get(seed)
