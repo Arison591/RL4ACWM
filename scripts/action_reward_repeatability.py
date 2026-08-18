@@ -51,13 +51,17 @@ def main() -> None:
     parser.add_argument("--output-dir", required=True)
     parser.add_argument("--repeats", type=int, default=3)
     parser.add_argument("--limit", type=int, default=48)
+    parser.add_argument("--offset", type=int, default=0)
+    parser.add_argument("--stride", type=int, default=1)
+    parser.add_argument("--worker-id", type=int, default=None)
     args = parser.parse_args()
     if args.repeats < 3:
         raise ValueError("repeatability audit requires at least 3 repeats")
 
     config = load_tempflow_config(args.config)
     reward = VideoRewardAdapter(config["reward"])
-    rollout_paths = sorted(Path(args.saved_run).glob("**/rollout.json"))[: args.limit]
+    all_rollout_paths = sorted(Path(args.saved_run).glob("**/rollout.json"))[: args.limit]
+    rollout_paths = all_rollout_paths[args.offset :: args.stride]
     if not rollout_paths:
         raise FileNotFoundError("no saved rollout.json files found")
     output = Path(args.output_dir)
@@ -90,7 +94,8 @@ def main() -> None:
             }
             rows.append(row)
 
-    csv_path = output / "reward_repeatability.csv"
+    suffix = "" if args.worker_id is None else f"_worker{args.worker_id}"
+    csv_path = output / f"reward_repeatability{suffix}.csv"
     with csv_path.open("w", newline="", encoding="utf-8") as handle:
         writer = csv.DictWriter(handle, fieldnames=list(rows[0]))
         writer.writeheader()
@@ -125,7 +130,7 @@ def main() -> None:
             "iou": floors["mean_iou"]["p95_abs_repeat_difference"],
         },
     }
-    (output / "reward_noise_floor.json").write_text(
+    (output / f"reward_noise_floor{suffix}.json").write_text(
         json.dumps(report, indent=2), encoding="utf-8"
     )
 
