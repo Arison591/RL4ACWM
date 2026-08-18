@@ -68,6 +68,11 @@ def _configure_runtime_rollout_schedule(
         runtime.scheduler.sigmas[-1] = runtime.scheduler.sigmas[-2]
 
 
+def _correction_initial_seed(base_seed: int, collection_attempt: int) -> int:
+    """Give every correction attempt its own deterministic ODE trajectory."""
+    return int(base_seed) + int(collection_attempt)
+
+
 def _numeric_reward_leaves(value: Any, prefix: str = "reward") -> dict[str, float]:
     if isinstance(value, dict):
         output: dict[str, float] = {}
@@ -516,6 +521,11 @@ def train(
                 condition_index, scheduled_timestep = collection_epoch % len(dataset), None
             raw = dataset[condition_index]
             prepared = runtime.prepare_condition(raw)
+            collection_initial_seed = (
+                _correction_initial_seed(initial_seed, collection_epoch)
+                if correction_mode
+                else initial_seed
+            )
             torch.cuda.reset_peak_memory_stats()
             started = time.monotonic()
             common_sampling = {
@@ -529,7 +539,7 @@ def train(
             # branches every selected k before changing theta_old.
             base_artifact = sampler.sample_base(
                 prepared,
-                initial_seed=initial_seed,
+                initial_seed=collection_initial_seed,
                 output_dir=rank_output,
                 prompt=DEFAULT_PROMPT,
             )
@@ -553,7 +563,7 @@ def train(
                 seeds = [global_seeds[index] for index in local_branch_ids]
                 _, rollouts = sampler.sample_group(
                     prepared,
-                    initial_seed=initial_seed,
+                    initial_seed=collection_initial_seed,
                     branch_timestep=branch_timestep,
                     branch_noise_seeds=seeds,
                     branch_ids=local_branch_ids,

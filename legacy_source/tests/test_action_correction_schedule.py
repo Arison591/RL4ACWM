@@ -4,6 +4,7 @@ import torch
 
 from experiments.tempflow_video.run import (
     _build_correction_schedule,
+    _correction_initial_seed,
     _configure_runtime_rollout_schedule,
 )
 from experiments.tempflow_video.sampler import TempFlowBranchSampler
@@ -70,3 +71,10 @@ def test_correction_resume_position_counts_only_valid_accumulated_groups():
     assert len(schedule) == 48
     assert 3 * groups_per_update == 12
     assert schedule[3 * groups_per_update] in schedule
+
+
+def test_correction_attempts_use_distinct_initial_noise_seeds():
+    seeds = [_correction_initial_seed(123456, attempt) for attempt in range(12)]
+
+    assert seeds == list(range(123456, 123468))
+    assert len(seeds) == len(set(seeds))
