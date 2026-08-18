@@ -24,6 +24,10 @@ tempflow:
 reward:
   mode: action
   geometry_enabled: false
+  # Sampling remains internally conditioned at RoPE fps=16; evaluation MP4s
+  # use the task's fixed 30-fps timeline to match action annotations and GT.
+  generated_fps: 30
+  expected_gt_fps: 30
   action_metric_weights:
     mean_iou: 0.1
     af_fdce_ate_norm: 0.7

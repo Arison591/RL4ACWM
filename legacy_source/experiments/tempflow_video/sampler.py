@@ -274,7 +274,11 @@ class TempFlowBranchSampler:
                 seed_dir = group_dir / f"branch_{branch_id:03d}"
                 seed_dir.mkdir(parents=True, exist_ok=False)
                 for view, camera in enumerate(self.runtime.args.data["train"]["valid_cam"]):
-                    save_video(full_video[view], str(seed_dir / f"{camera}_color.mp4"), fps=16)
+                    save_video(
+                        full_video[view],
+                        str(seed_dir / f"{camera}_color.mp4"),
+                        fps=int(self.runtime.config["reward"].get("generated_fps", 30)),
+                    )
                 sample_id = (
                     f"{prepared.condition_id}:p{self.runtime.policy_version}:s{int(initial_seed)}:"
                     f"t{branch_timestep}:b{branch_id}"
@@ -448,7 +452,11 @@ class FlowGRPOVideoSampler:
                 seed_dir = group_dir / f"rollout_{rollout_id:03d}"
                 seed_dir.mkdir(parents=True, exist_ok=False)
                 for view, camera in enumerate(self.runtime.args.data["train"]["valid_cam"]):
-                    save_video(full_video[view], str(seed_dir / f"{camera}_color.mp4"), fps=16)
+                    save_video(
+                        full_video[view],
+                        str(seed_dir / f"{camera}_color.mp4"),
+                        fps=int(self.runtime.config["reward"].get("generated_fps", 30)),
+                    )
                 rollout = OrdinaryRollout(
                     sample_id=(
                         f"{prepared.condition_id}:p{self.runtime.policy_version}:"
