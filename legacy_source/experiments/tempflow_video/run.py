@@ -486,18 +486,32 @@ def train(
                 timesteps=timesteps,
                 seed=int(config.get("seed", 0)),
             )
+            # The 48-item schedule is a coverage contract over *valid*
+            # command groups.  Failed command gates retry the same item with
+            # fresh branch noise; they must not silently reduce a 12-update
+            # correction run to fewer valid groups.
+            scheduled_group_index = trainer.optimizer_step * groups_per_update
+            if not 0 <= scheduled_group_index <= len(correction_schedule):
+                raise RuntimeError("correction checkpoint has an invalid schedule position")
+            max_correction_attempts = target_steps * max_group_attempts_per_update
         else:
             correction_schedule = []
+            scheduled_group_index = 0
+            max_correction_attempts = max_rollout_epochs
         pending_rollout_buffer: list[list[BranchRollout]] = []
         pending_global_group_sizes: list[int] = []
         pending_group_rows: list[dict[str, Any]] = []
         pending_policy_version: int | None = None
         pending_attempts = 0
-        while trainer.optimizer_step < target_steps and trainer.rollout_epoch < max_rollout_epochs:
+        while (
+            trainer.optimizer_step < target_steps
+            and trainer.rollout_epoch < max_correction_attempts
+            and (not correction_mode or scheduled_group_index < len(correction_schedule))
+        ):
             collection_epoch = trainer.rollout_epoch
             collection_policy_version = trainer.policy_version
             if correction_mode:
-                condition_index, scheduled_timestep = correction_schedule[collection_epoch]
+                condition_index, scheduled_timestep = correction_schedule[scheduled_group_index]
             else:
                 condition_index, scheduled_timestep = collection_epoch % len(dataset), None
             raw = dataset[condition_index]
@@ -641,6 +655,8 @@ def train(
                     "branches_per_rank": [len(rows) for rows in gathered_reward_rows],
                     **advantage_metrics,
                 }
+                if correction_mode:
+                    group_row["scheduled_group_index"] = scheduled_group_index
                 if advantages is None:
                     group_row["excluded_from_optimizer"] = True
                     group_row["skip_reason"] = skip_reason
@@ -670,6 +686,8 @@ def train(
                 rollout_group_rows.append(group_row)
                 rollout_buffer.append(valid_rollouts)
                 global_group_sizes.append(len(global_reward_rows))
+                if correction_mode:
+                    scheduled_group_index += 1
 
             if not rollout_buffer:
                 if correction_mode and pending_attempts >= max_group_attempts_per_update:
@@ -813,7 +831,8 @@ def train(
         if trainer.optimizer_step < target_steps:
             raise RuntimeError(
                 f"only completed {trainer.optimizer_step}/{target_steps} optimizer steps after "
-                f"{trainer.rollout_epoch} rollout epochs"
+                f"{trainer.rollout_epoch} rollout attempts "
+                f"({scheduled_group_index}/{len(correction_schedule)} valid scheduled groups)"
             )
         return
 

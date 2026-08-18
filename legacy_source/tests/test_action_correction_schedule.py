@@ -55,3 +55,18 @@ def test_correction_branch_positions_use_the_15_step_rollout_schedule():
 
     assert selected == [6, 8, 10]
     assert all(0 <= index < 14 for index in selected)
+
+
+def test_correction_resume_position_counts_only_valid_accumulated_groups():
+    groups_per_update = 4
+    schedule = _build_correction_schedule(
+        condition_count=16,
+        timesteps=[6, 8, 10],
+        seed=42,
+    )
+
+    # Checkpoints are written only after a complete four-group update, so the
+    # next schedule item is determined by valid groups, never rejected tries.
+    assert len(schedule) == 48
+    assert 3 * groups_per_update == 12
+    assert schedule[3 * groups_per_update] in schedule
