@@ -1,4 +1,4 @@
-base_config: configs/psnr_only_overfit224_4gpu.yaml
+base_config: ${TEMPFLOW_STANDALONE_ROOT}/configs/psnr_only_overfit224_4gpu.yaml
 output_dir: ${TEMPFLOW_OUTPUT_ROOT}/action_component_correction_4gpu
 max_optimizer_steps: 12
 

@@ -28,6 +28,7 @@ if [[ "${visible_gpu_count}" != 4 ]]; then
   exit 2
 fi
 export PYTHONPATH="${repo_root}/src:${repo_root}/legacy_source:${AWM_UPSTREAM_ROOT}${PYTHONPATH:+:${PYTHONPATH}}"
+export TEMPFLOW_STANDALONE_ROOT="${repo_root}"
 export WANDB_MODE="${WANDB_MODE:-offline}"
 export OMP_NUM_THREADS="${OMP_NUM_THREADS:-1}"
 export NCCL_ASYNC_ERROR_HANDLING="${NCCL_ASYNC_ERROR_HANDLING:-1}"
