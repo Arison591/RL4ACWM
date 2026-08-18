@@ -50,7 +50,9 @@ def _read_rows(path: Path) -> dict[tuple[str, int], dict[str, Any]]:
 def _metric(row: dict[str, Any], key: str) -> float:
     if key == "total_reward":
         return float(row["reward"]["total_reward"])
-    if key == "raw_command_error":
+    if key == "combined_raw_command_error":
+        return float(row["reward"]["action_metrics"]["combined_raw_command_error"])
+    if key == "command_train_reward":
         return -float(row["reward"]["action_metrics"]["combined_raw_command_error"])
     return float(row["reward"]["action_reward_components"]["components"][key])
 
@@ -90,7 +92,15 @@ def main() -> None:
     if set(base) != set(final) or len(base) != 128:
         raise RuntimeError("base/final paired evaluation does not contain the required 128 identical keys")
     report: dict[str, Any] = {"pairs": len(base), "final_policy_version": final_version, "metrics": {}}
-    for name in ("total_reward", "raw_command_error", "fdce", "mean_iou"):
+    # The natural raw error is kept explicitly (lower is better); its negated
+    # counterpart is the high-is-good training component used by GRPO.
+    for name in (
+        "total_reward",
+        "combined_raw_command_error",
+        "command_train_reward",
+        "fdce",
+        "mean_iou",
+    ):
         differences = {key: _metric(final[key], name) - _metric(base[key], name) for key in base}
         values = np.asarray(list(differences.values()), dtype=np.float64)
         wins = int((values > 0).sum())
@@ -106,6 +116,7 @@ def main() -> None:
             # unlike branch training it has no single selected transition.
             by_timestep["full_generation"].append(value)
         report["metrics"][name] = {
+            "higher_is_better": name != "combined_raw_command_error",
             "mean_difference": float(values.mean()),
             "median_difference": float(np.median(values)),
             "std_difference": float(values.std()),
