@@ -616,6 +616,7 @@ def train(
                             "group_attempt": trainer.group_attempts,
                             "condition_id": raw.condition_id,
                             "branch_timestep": branch_timestep,
+                            "initial_seed": collection_initial_seed,
                             "excluded_from_optimizer": True,
                             "skip_reason": "reward_scoring_invalid",
                         }
@@ -639,6 +640,7 @@ def train(
                             "group_attempt": trainer.group_attempts,
                             "condition_id": raw.condition_id,
                             "branch_timestep": branch_timestep,
+                            "initial_seed": collection_initial_seed,
                             "valid_branches": len(global_reward_rows),
                             "excluded_from_optimizer": True,
                             "skip_reason": "insufficient_valid_branches",
@@ -658,6 +660,7 @@ def train(
                     "group_attempt": trainer.group_attempts,
                     "condition_id": raw.condition_id,
                     "branch_timestep": branch_timestep,
+                    "initial_seed": collection_initial_seed,
                     "flow_time": float(rollouts[0].flow_time),
                     "next_flow_time": float(rollouts[0].next_flow_time),
                     "collection_policy_version": collection_policy_version,
