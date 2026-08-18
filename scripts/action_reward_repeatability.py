@@ -16,6 +16,7 @@ import numpy as np
 
 from experiments.tempflow_video.config import load_tempflow_config
 from experiments.tempflow_video.reward_adapter import VideoRewardAdapter
+from experiments.action_following.yolo_detector import reset_eef_detector_state
 
 
 COMPONENTS = (
@@ -69,11 +70,18 @@ def main() -> None:
         if not prep_dir.is_dir():
             raise FileNotFoundError(f"missing prep directory: {prep_dir}")
         for repeat in range(args.repeats):
-            result = reward.score_paths(
-                condition_id=condition_id,
-                prep_dir=str(prep_dir),
-                prediction_dir=rollout_path.parent,
-            )
+            # SAM3 inference states are local to each track_masks invocation;
+            # CoWTracker forward is stateless. YOLO owns the only reusable
+            # video tracker state, so reset it explicitly around every pass.
+            reset_eef_detector_state()
+            try:
+                result = reward.score_paths(
+                    condition_id=condition_id,
+                    prep_dir=str(prep_dir),
+                    prediction_dir=rollout_path.parent,
+                )
+            finally:
+                reset_eef_detector_state()
             row: dict[str, Any] = {
                 "rollout_path": str(rollout_path.parent),
                 "condition_id": condition_id,
