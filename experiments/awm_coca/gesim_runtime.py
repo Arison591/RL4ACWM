@@ -298,7 +298,11 @@ class PersistentGeSimRuntime:
             future = frames[b * views:(b + 1) * views]
             videos = torch.cat((observation, future), dim=2).clamp(-1, 1)
             for view, camera in enumerate(self.args.data["train"]["valid_cam"]):
-                save_video(videos[view], str(seed_dir / f"{camera}_color.mp4"), fps=16)
+                save_video(
+                    videos[view],
+                    str(seed_dir / f"{camera}_color.mp4"),
+                    fps=int(self.config["reward"].get("generated_fps", 30)),
+                )
             rollout_metadata = {
                 "condition_id": prepared.condition_id, "policy_version": self.policy_version,
                 "seed": int(seed), "num_chunks": 1,
