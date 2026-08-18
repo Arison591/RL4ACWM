@@ -48,6 +48,26 @@ def _seed_everything(seed: int) -> None:
     torch.cuda.manual_seed_all(seed)
 
 
+def _configure_runtime_rollout_schedule(
+    runtime: PersistentGeSimRuntime, *, reverse_denoise_steps: int
+) -> None:
+    """Match the sigma schedule rebuilt by GE-Sim for every rollout.
+
+    Branch positions are indices into the captured rollout trajectory, not the
+    scheduler's model-load default schedule.  Resolve them only after setting
+    the exact schedule used by ``GeSimPipeline.infer``.
+    """
+    steps = int(reverse_denoise_steps)
+    if steps < 2:
+        raise ValueError("reverse_denoise_steps must be at least 2")
+    runtime.scheduler.set_timesteps(
+        sigmas=torch.linspace(0, 1, steps, dtype=torch.float64),
+        device=runtime.device,
+    )
+    if getattr(runtime.scheduler.config, "final_sigmas_type", None) == "sigma_min":
+        runtime.scheduler.sigmas[-1] = runtime.scheduler.sigmas[-2]
+
+
 def _numeric_reward_leaves(value: Any, prefix: str = "reward") -> dict[str, float]:
     if isinstance(value, dict):
         output: dict[str, float] = {}
@@ -353,6 +373,10 @@ def train(
     manifest = _make_manifest(config, run_dir, write_files=distributed.is_main)
     dataset = PrepConditionDataset(manifest)
     runtime = PersistentGeSimRuntime(config, device=distributed.device)
+    _configure_runtime_rollout_schedule(
+        runtime,
+        reverse_denoise_steps=int(config["rollout"]["reverse_denoise_steps"]),
+    )
     policy = VideoPolicyAdapter(runtime)
     reference = ReferencePolicyAdapter(policy)
     trainer = TempFlowVideoTrainer(
