@@ -129,3 +129,8 @@ def test_four_independent_on_policy_groups_make_exactly_one_update(tmp_path):
     assert len(records) == 1
     assert records[0].optimizer_step == 1
     assert records[0].policy_version == 1
+    diagnostics = trainer.last_group_gradient_diagnostics
+    assert len(diagnostics) == 4
+    assert all(item["policy_grad_norm"] > 0.0 for item in diagnostics)
+    assert all(item["kl_grad_norm"] == pytest.approx(0.0) for item in diagnostics)
+    assert 0.0 <= diagnostics[0]["window_policy_gradient_coherence"] <= 1.0

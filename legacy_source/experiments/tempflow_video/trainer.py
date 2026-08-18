@@ -79,6 +79,17 @@ class TempFlowVideoTrainer:
         self.rollout_epoch = 0
         self._consumed_groups: set[str] = set()
         self._previous_gradients: list[torch.Tensor] | None = None
+        self.last_group_gradient_diagnostics: list[dict[str, float | str]] = []
+
+    def _diagnostic_gradient(self, gradients: Sequence[torch.Tensor | None]) -> torch.Tensor:
+        """Use a fixed small LoRA slice so group diagnostics cannot OOM."""
+        pieces = []
+        for gradient in gradients[:4]:
+            if gradient is not None:
+                pieces.append(gradient.detach().flatten()[:1024])
+        if not pieces:
+            return torch.zeros(1, device=self.policy.runtime.device)
+        return torch.cat(pieces)
 
     def _validate_group(
         self,
@@ -140,6 +151,7 @@ class TempFlowVideoTrainer:
         self.policy.policy_model.train()
         trainable_before = [parameter.detach().clone() for parameter in self.parameters]
         self.optimizer.zero_grad(set_to_none=True)
+        group_diagnostic_vectors: dict[str, dict[str, torch.Tensor]] = {}
         term_buffers = None
         if self.config.log_term_grad_norm:
             term_buffers = {
@@ -148,6 +160,9 @@ class TempFlowVideoTrainer:
             }
         metric_rows: list[dict[str, float]] = []
         for rollout in rollouts:
+            group_id = rollout.group_key.group_id(rollout.policy_version)
+            if group_id not in group_diagnostic_vectors:
+                group_diagnostic_vectors[group_id] = {}
             actions = rollout.transitions if isinstance(rollout, OrdinaryRollout) else [rollout]
             # Every rank contributes its local shard to one global group mean.
             # The reducer performs SUM, so no extra world-size division belongs here.
@@ -207,6 +222,25 @@ class TempFlowVideoTrainer:
                     clip_range=self.config.clip_range,
                     kl_beta=self.config.kl_beta,
                 )
+                diagnostic_parameters = self.parameters[:4]
+                policy_gradients = torch.autograd.grad(
+                    output.policy_loss * action_scale,
+                    diagnostic_parameters,
+                    retain_graph=True,
+                    allow_unused=True,
+                )
+                kl_gradients = torch.autograd.grad(
+                    output.weighted_kl_loss * action_scale,
+                    diagnostic_parameters,
+                    retain_graph=True,
+                    allow_unused=True,
+                )
+                for name, gradients in (("policy", policy_gradients), ("kl", kl_gradients)):
+                    vector = self._diagnostic_gradient(gradients)
+                    if name in group_diagnostic_vectors[group_id]:
+                        group_diagnostic_vectors[group_id][name].add_(vector)
+                    else:
+                        group_diagnostic_vectors[group_id][name] = vector
                 if term_buffers is not None:
                     terms = {
                         "policy": output.policy_loss,
@@ -244,6 +278,49 @@ class TempFlowVideoTrainer:
             if term_buffers is not None:
                 for buffers in term_buffers.values():
                     self.gradient_reducer(buffers)
+            for vectors in group_diagnostic_vectors.values():
+                self.gradient_reducer([vectors["policy"], vectors["kl"]])
+
+        self.last_group_gradient_diagnostics = []
+        cumulative_policy = None
+        previous_policy = None
+        for group_id in sorted(group_diagnostic_vectors):
+            policy_vector = group_diagnostic_vectors[group_id]["policy"].float()
+            kl_vector = group_diagnostic_vectors[group_id]["kl"].float()
+            policy_norm = float(policy_vector.norm().item())
+            kl_norm = float(kl_vector.norm().item())
+            policy_kl_cosine = 0.0
+            if policy_norm > 0.0 and kl_norm > 0.0:
+                policy_kl_cosine = float(torch.dot(policy_vector, kl_vector).item() / (policy_norm * kl_norm))
+            previous_cosine = 0.0
+            if previous_policy is not None and policy_norm > 0.0:
+                previous_norm = float(previous_policy.norm().item())
+                if previous_norm > 0.0:
+                    previous_cosine = float(torch.dot(policy_vector, previous_policy).item() / (policy_norm * previous_norm))
+            cumulative_cosine = 0.0
+            if cumulative_policy is not None and policy_norm > 0.0:
+                cumulative_norm = float(cumulative_policy.norm().item())
+                if cumulative_norm > 0.0:
+                    cumulative_cosine = float(torch.dot(policy_vector, cumulative_policy).item() / (policy_norm * cumulative_norm))
+            if cumulative_policy is None:
+                cumulative_policy = policy_vector.clone()
+            else:
+                cumulative_policy.add_(policy_vector)
+            self.last_group_gradient_diagnostics.append({
+                "group_id": group_id,
+                "policy_grad_norm": policy_norm,
+                "kl_grad_norm": kl_norm,
+                "policy_kl_grad_ratio": policy_norm / max(kl_norm, 1.0e-20),
+                "policy_kl_grad_cosine": policy_kl_cosine,
+                "policy_grad_cosine_previous_group": previous_cosine,
+                "policy_grad_cosine_accumulated": cumulative_cosine,
+            })
+            previous_policy = policy_vector
+        if cumulative_policy is not None:
+            sum_norms = sum(float(item["policy_grad_norm"]) for item in self.last_group_gradient_diagnostics)
+            coherence = float(cumulative_policy.norm().item()) / max(sum_norms, 1.0e-20)
+            for item in self.last_group_gradient_diagnostics:
+                item["window_policy_gradient_coherence"] = coherence
 
         total_grad_norm_before = _gradient_norm(parameter.grad for parameter in self.parameters)
         if not math.isfinite(total_grad_norm_before):

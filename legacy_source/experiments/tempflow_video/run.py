@@ -616,7 +616,8 @@ def train(
                     group_row["skip_reason"] = skip_reason
                     if distributed.is_main:
                         _jsonl(run_dir / "rollout_groups.jsonl", group_row)
-                    rollout_group_rows.append(group_row)
+                    if not correction_mode:
+                        rollout_group_rows.append(group_row)
                     continue
                 advantage_clip = (
                     float("inf")
@@ -661,6 +662,17 @@ def train(
             )
             trainer.rollout_epoch += 1
             runtime.set_policy_version(trainer.policy_version)
+            if correction_mode:
+                group_rows_by_id = {
+                    group[0].group_key.group_id(collection_policy_version): row
+                    for group, row in zip(rollout_buffer, rollout_group_rows)
+                }
+                for diagnostic in trainer.last_group_gradient_diagnostics:
+                    row = dict(diagnostic)
+                    row.update(group_rows_by_id.get(str(diagnostic["group_id"]), {}))
+                    row["optimizer_step"] = trainer.optimizer_step
+                    if distributed.is_main:
+                        _jsonl(run_dir / "group_gradient_diagnostics.jsonl", row)
             for minibatch_index, record in enumerate(records):
                 gathered_records = distributed.gather_objects(
                     {
@@ -695,6 +707,11 @@ def train(
                         int(row["branch_timestep"]) for row in rollout_group_rows
                     ],
                     "groups_accumulated_per_optimizer_step": len(rollout_buffer),
+                    "window_policy_gradient_coherence": (
+                        trainer.last_group_gradient_diagnostics[0].get(
+                            "window_policy_gradient_coherence", 0.0
+                        ) if correction_mode and trainer.last_group_gradient_diagnostics else 0.0
+                    ),
                     "elapsed_seconds_total": time.monotonic() - started,
                     "peak_cuda_allocated_bytes": torch.cuda.max_memory_allocated(),
                     "peak_cuda_reserved_bytes": torch.cuda.max_memory_reserved(),
