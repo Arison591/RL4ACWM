@@ -34,7 +34,7 @@ def test_fixed16_condition_ids_are_unique_and_exclude_known_incomplete_gate() ->
     assert len(ids) == 16
     assert len(set(ids)) == 16
     assert "170_task_694_episode_882404" not in ids
-    assert "171_task_694_episode_882421" in ids
+    assert "041_task_429_episode_684455" in ids
 
 
 def _args(tmp_path: Path) -> Namespace:
