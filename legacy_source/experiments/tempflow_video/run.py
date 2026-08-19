@@ -69,6 +69,10 @@ def _initialize_rank_local_sam3_serially(
                 raise TimeoutError(f"timed out waiting for SAM3 initialization on rank {local_rank - 1}")
             time.sleep(0.2)
     loader()
+    # ``model.to(cuda)`` enqueues copies asynchronously.  The rendezvous must
+    # denote completed device initialization, not merely queued work.
+    if torch.cuda.is_available():
+        torch.cuda.synchronize()
     (sync_root / f"rank_{local_rank}.ready").write_text("ready\n", encoding="utf-8")
 
 
