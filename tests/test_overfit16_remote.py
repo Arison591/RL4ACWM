@@ -29,6 +29,14 @@ def _condition_ids() -> list[str]:
     ]
 
 
+def test_fixed16_condition_ids_are_unique_and_exclude_known_incomplete_gate() -> None:
+    ids = _condition_ids()
+    assert len(ids) == 16
+    assert len(set(ids)) == 16
+    assert "170_task_694_episode_882404" not in ids
+    assert "171_task_694_episode_882421" in ids
+
+
 def _args(tmp_path: Path) -> Namespace:
     return Namespace(
         prep_root=None,
