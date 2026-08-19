@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import math
 import os
+import threading
 from pathlib import Path
 from typing import Any
 
@@ -31,11 +32,22 @@ class TempFlowWandbLogger:
     def __init__(self, config: dict[str, Any], run_dir: str | Path, *, enabled: bool) -> None:
         self.run = None
         self.wandb = None
+        self._init_thread: threading.Thread | None = None
+        self._init_error: Exception | None = None
         self.run_dir = Path(run_dir)
         self.status_path = self.run_dir / "logs" / "wandb_run.txt"
         mode = str(config.get("logging", {}).get("wandb_mode", "offline")).lower()
         if not enabled or mode == "disabled":
             return
+        # W&B login/init can block on DNS or the API.  Never hold the
+        # distributed startup barrier while doing network I/O: rank 0 starts
+        # the observer in the background and the training collectives proceed.
+        self._init_thread = threading.Thread(
+            target=self._initialize, args=(config, mode), daemon=True, name="wandb-init"
+        )
+        self._init_thread.start()
+
+    def _initialize(self, config: dict[str, Any], mode: str) -> None:
         try:
             import wandb
             from experiments.awm_coca.wandb_monitor import (
@@ -79,6 +91,7 @@ class TempFlowWandbLogger:
             )
             print(f"[INFO] TempFlow W&B enabled: {getattr(self.run, 'url', 'offline')}", flush=True)
         except Exception as exc:
+            self._init_error = exc
             self._disable("initialization", exc)
 
     def _disable(self, stage: str, exc: Exception) -> None:
@@ -124,6 +137,8 @@ class TempFlowWandbLogger:
             self._disable("evaluation upload", exc)
 
     def finish(self) -> None:
+        if self._init_thread is not None and self._init_thread.is_alive():
+            self._init_thread.join(timeout=20.0)
         if self.run is None:
             return
         try:
