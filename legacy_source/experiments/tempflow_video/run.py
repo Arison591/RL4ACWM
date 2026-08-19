@@ -33,6 +33,7 @@ from experiments.tempflow_video.preflight import run_preflight, write_preflight_
 from experiments.tempflow_video.sampler import FlowGRPOVideoSampler, TempFlowBranchSampler
 from experiments.tempflow_video.schemas import BranchRollout
 from experiments.tempflow_video.trainer import TempFlowOptimizerConfig, TempFlowVideoTrainer
+from experiments.tempflow_video.wandb_logger import TempFlowWandbLogger
 
 
 def _jsonl(path: Path, row: dict[str, Any]) -> None:
@@ -395,6 +396,7 @@ def train(
     resume: str | None,
     max_steps: int | None,
     distributed: DistributedContext,
+    wandb_logger: TempFlowWandbLogger | None = None,
 ) -> None:
     from experiments.tempflow_video.reward_adapter import VideoRewardAdapter
 
@@ -480,6 +482,8 @@ def train(
                 tag="policy_00000000_baseline",
             )
             _jsonl(run_dir / "evaluation_history.jsonl", baseline)
+            if wandb_logger is not None:
+                wandb_logger.log_evaluation({"optimizer_step": trainer.optimizer_step, **baseline})
         distributed.barrier()
 
     if branching:
@@ -650,6 +654,8 @@ def train(
                         }
                         if distributed.is_main:
                             _jsonl(run_dir / "rollout_groups.jsonl", group_row)
+                            if wandb_logger is not None:
+                                wandb_logger.log_group(group_row)
                         continue
                     raise RuntimeError(
                         "at least one rank has no valid PSNR branch; refusing desynchronized update"
@@ -675,6 +681,8 @@ def train(
                         }
                         if distributed.is_main:
                             _jsonl(run_dir / "rollout_groups.jsonl", group_row)
+                            if wandb_logger is not None:
+                                wandb_logger.log_group(group_row)
                         continue
                     raise RuntimeError(
                         f"valid reward branches {len(global_reward_rows)} < required {minimum}; "
@@ -703,6 +711,8 @@ def train(
                     group_row["skip_reason"] = skip_reason
                     if distributed.is_main:
                         _jsonl(run_dir / "rollout_groups.jsonl", group_row)
+                        if wandb_logger is not None:
+                            wandb_logger.log_group(group_row)
                     if not correction_mode:
                         rollout_group_rows.append(group_row)
                     continue
@@ -724,6 +734,8 @@ def train(
                 group_row["excluded_from_optimizer"] = False
                 if distributed.is_main:
                     _jsonl(run_dir / "rollout_groups.jsonl", group_row)
+                    if wandb_logger is not None:
+                        wandb_logger.log_group(group_row)
                 rollout_group_rows.append(group_row)
                 rollout_buffer.append(valid_rollouts)
                 global_group_sizes.append(len(global_reward_rows))
@@ -820,6 +832,8 @@ def train(
                 }
                 if distributed.is_main:
                     _jsonl(run_dir / "optimizer_steps.jsonl", step_row)
+                    if wandb_logger is not None:
+                        wandb_logger.log_step(step_row)
                     print(json.dumps(step_row, ensure_ascii=False, default=str), flush=True)
 
             if correction_mode:
@@ -868,6 +882,8 @@ def train(
                         tag=f"policy_{runtime.policy_version:08d}",
                     )
                     _jsonl(run_dir / "evaluation_history.jsonl", summary)
+                    if wandb_logger is not None:
+                        wandb_logger.log_evaluation({"optimizer_step": trainer.optimizer_step, **summary})
                 distributed.barrier()
         if trainer.optimizer_step < target_steps:
             raise RuntimeError(
@@ -985,6 +1001,8 @@ def train(
             group_row["optimizer_update_skipped"] = True
             if distributed.is_main:
                 _jsonl(run_dir / "groups.jsonl", group_row)
+                if wandb_logger is not None:
+                    wandb_logger.log_group(group_row)
             continue
         advantage_clip = float(config.get("reward_fusion", {}).get("advantage_clip", float("inf")))
         advantage_by_id = dict(zip(global_ids, advantages.advantages.tolist()))
@@ -1034,6 +1052,8 @@ def train(
         group_row["peak_cuda_reserved_bytes"] = torch.cuda.max_memory_reserved()
         if distributed.is_main:
             _jsonl(run_dir / "groups.jsonl", group_row)
+            if wandb_logger is not None:
+                wandb_logger.log_group(group_row)
         if trainer.optimizer_step % checkpoint_every == 0 or trainer.optimizer_step == target_steps:
             if distributed.is_main:
                 save_tempflow_checkpoint(
@@ -1068,6 +1088,8 @@ def train(
                     tag=f"policy_{runtime.policy_version:08d}",
                 )
                 _jsonl(run_dir / "evaluation_history.jsonl", summary)
+                if wandb_logger is not None:
+                    wandb_logger.log_evaluation({"optimizer_step": trainer.optimizer_step, **summary})
             distributed.barrier()
         if distributed.is_main:
             print(json.dumps(group_row, ensure_ascii=False, default=str), flush=True)
@@ -1119,6 +1141,7 @@ def main() -> None:
     distributed = DistributedContext.initialize(
         int(config.get("distributed", {}).get("world_size", 1))
     )
+    wandb_logger: TempFlowWandbLogger | None = None
     try:
         _seed_everything(int(config.get("seed", 42)))
         if not args.skip_preflight and distributed.is_main:
@@ -1132,6 +1155,7 @@ def main() -> None:
         run_dir = distributed.broadcast_path(local_run_dir)
         if distributed.is_main:
             dump_effective_config(config, run_dir / "effective_config.yaml")
+            wandb_logger = TempFlowWandbLogger(config, run_dir, enabled=True)
         distributed.barrier()
         if config["experiment"]["mode"] == "base_eval":
             if distributed.is_main:
@@ -1159,8 +1183,11 @@ def main() -> None:
                 resume=args.resume,
                 max_steps=args.max_optimizer_steps,
                 distributed=distributed,
+                wandb_logger=wandb_logger,
             )
     finally:
+        if wandb_logger is not None:
+            wandb_logger.finish()
         distributed.close()
 
 

@@ -1,0 +1,21 @@
+base_config: ${TEMPFLOW_STANDALONE_ROOT}/configs/action_component_correction_4gpu.yaml
+output_dir: ${TEMPFLOW_OUTPUT_ROOT}/action_following_overfit16_4gpu
+max_optimizer_steps: 12
+
+experiment:
+  name: action_following_overfit16_4gpu
+  mode: tempflow_branch_only
+
+# This is a pure action-following overfit: only the raw, arm-matched command
+# error forms the policy advantage. FDCE and IoU remain logged diagnostics.
+reward_fusion:
+  mode: action_component_raw_command
+  action_component_noise_floor_file: ${ACTION_REWARD_NOISE_FLOOR_FILE}
+  action_component_weights:
+    command: 1.0
+    fdce: 0.0
+    iou: 0.0
+
+logging:
+  wandb_mode: online
+
