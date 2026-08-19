@@ -48,6 +48,30 @@ def _seed_everything(seed: int) -> None:
     torch.cuda.manual_seed_all(seed)
 
 
+def _initialize_rank_local_sam3_serially(
+    *, local_rank: int, world_size: int, sync_root: Path, loader: Any, timeout_seconds: float = 1800.0
+) -> None:
+    """Construct one rank-local SAM3 instance at a time before NCCL exists.
+
+    SAM3 owns a large CUDA model.  Starting all copies concurrently can leave
+    later ranks in a prolonged CUDA initialization stall before the trainer
+    process group is available.  A tiny filesystem rendezvous retains the
+    required pre-NCCL construction while avoiding that contention.
+    """
+    if not 0 <= local_rank < world_size:
+        raise ValueError("SAM3 local rank must lie inside the local world")
+    sync_root.mkdir(parents=True, exist_ok=True)
+    if local_rank:
+        predecessor = sync_root / f"rank_{local_rank - 1}.ready"
+        deadline = time.monotonic() + timeout_seconds
+        while not predecessor.exists():
+            if time.monotonic() >= deadline:
+                raise TimeoutError(f"timed out waiting for SAM3 initialization on rank {local_rank - 1}")
+            time.sleep(0.2)
+    loader()
+    (sync_root / f"rank_{local_rank}.ready").write_text("ready\n", encoding="utf-8")
+
+
 def _configure_runtime_rollout_schedule(
     runtime: PersistentGeSimRuntime, *, reverse_denoise_steps: int
 ) -> None:
@@ -1080,7 +1104,14 @@ def main() -> None:
             torch.cuda.set_device(local_rank)
         from experiments.action_following.sam_tracking import get_sam3_video_model
 
-        get_sam3_video_model()
+        local_world_size = int(os.environ.get("WORLD_SIZE", "1"))
+        rendezvous_id = f"{os.getppid()}_{os.environ.get('MASTER_PORT', 'single')}"
+        _initialize_rank_local_sam3_serially(
+            local_rank=local_rank,
+            world_size=local_world_size,
+            sync_root=Path("/tmp") / f"tempflow_sam3_init_{rendezvous_id}",
+            loader=get_sam3_video_model,
+        )
     distributed = DistributedContext.initialize(
         int(config.get("distributed", {}).get("world_size", 1))
     )
