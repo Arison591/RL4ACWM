@@ -1,0 +1,21 @@
+experiment: {name: overfit16_component_advantage, formal_training: true}
+upstream: {commit: dce69e48a952449e873a791812e506df878bc8a9}
+dataset: {name: overfit16, shuffle: false}
+rollout:
+  initial_seed: 123456
+  branch_noise_seed_base: 910000
+  branch_timesteps: [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13]
+  branch_factor: 6
+psnr:
+  training_frame_scope: future_only
+  evaluation_frame_scope: [full, future_only]
+reward_fusion:
+  mode: component_advantage
+  lambda_action: 0.0
+  lambda_psnr: 1.0
+  advantage_clip: 1.0
+  psnr_min_group_std_db: 0.0002
+  action_min_group_std: 0.0001
+training: {max_optimizer_steps: 224, execute_requires_approval: true}
+evaluation: {at_groups: [0, 112, 224], samples: 16, generation_seeds: [12345678]}
+logging: {wandb_mode: offline, debug_gradient_terms: true}

@@ -1,0 +1,20 @@
+{
+  "logical_id": "psnr-only-real-awm-smoke-20260816",
+  "condition_id": "001_task_327_episode_684757",
+  "branch_timestep": 2,
+  "branches": 2,
+  "optimizer_updates": 1,
+  "psnr_future_db": [20.403460020022425, 20.630714145052938],
+  "psnr_full_db": [22.426037429553148, 22.617286590944133],
+  "psnr_advantages": [-0.9999911993571142, 0.9999911993571142],
+  "psnr_policy_grad_norm": 0.00014715336146764457,
+  "total_grad_norm_before_clip": 0.00014718117017764598,
+  "changed_lora_tensors": 224,
+  "trainable_lora_tensors": 448,
+  "reference_unchanged": true,
+  "checkpoint_restored_tensors": 448,
+  "legacy_source_imports": 0,
+  "external_output_size_bytes": 331947474,
+  "external_report_sha256": "02e3fee4b9e80ac3aa917ae21e55b4d0593b4f5869195f11266a6076ff96ab24",
+  "payload_committed": false
+}

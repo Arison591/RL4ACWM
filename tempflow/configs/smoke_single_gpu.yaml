@@ -1,0 +1,17 @@
+experiment: {name: tempflow_component_smoke, formal_training: false}
+upstream: {commit: dce69e48a952449e873a791812e506df878bc8a9}
+dataset: {limit: 1}
+rollout: {initial_seed: 123456, branch_timesteps: [2], branch_factor: 2}
+training: {max_optimizer_steps: 3}
+psnr:
+  training_frame_scope: future_only
+  evaluation_frame_scope: [full, future_only]
+reward_fusion:
+  mode: component_advantage
+  lambda_action: 0.5
+  lambda_psnr: 0.5
+  advantage_clip: 1.0
+  psnr_min_group_std_db: null
+  action_min_group_std: null
+logging: {wandb_mode: offline, debug_gradient_terms: true}
+

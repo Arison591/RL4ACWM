@@ -1,0 +1,62 @@
+base_config: ${TEMPFLOW_STANDALONE_ROOT}/configs/psnr_only_overfit224_4gpu.yaml
+output_dir: ${TEMPFLOW_OUTPUT_ROOT}/action_component_correction_4gpu
+max_optimizer_steps: 12
+
+experiment:
+  name: action_component_correction_4gpu
+  mode: tempflow_branch_only
+
+dataset:
+  include_samples: []
+  expected_num_samples: 16
+  limit: 16
+
+rollout:
+  group_size: 12
+
+model:
+  checkpoint_root: ${AWM_MODEL_ROOT}
+
+tempflow:
+  branch_factor: 12
+  branch_timestep_fractions: [0.2, 0.5, 0.8]
+
+reward:
+  mode: action
+  geometry_enabled: false
+  # Sampling remains internally conditioned at RoPE fps=16; evaluation MP4s
+  # use the task's fixed 30-fps timeline to match action annotations and GT.
+  generated_fps: 30
+  expected_gt_fps: 30
+  action_metric_weights:
+    mean_iou: 0.1
+    af_fdce_ate_norm: 0.7
+    fdce: 0.2
+  action_weight: 1.0
+  geometry_weight: 0.0
+  min_valid_seeds_per_group: 12
+
+reward_fusion:
+  mode: action_component_raw_command
+  action_component_noise_floor_file: ${ACTION_REWARD_NOISE_FLOOR_FILE}
+  action_component_weights:
+    command: 0.7
+    fdce: 0.2
+    iou: 0.1
+
+training:
+  max_optimizer_steps: 12
+  max_rollout_epochs: 48
+  action_four_group_accumulation: true
+  groups_per_optimizer_step: 4
+  max_group_attempts_per_update: 12
+  optimizer_minibatches_per_rollout_epoch: 1
+  num_inner_epochs: 1
+  shuffle_rollout_buffer: false
+  checkpoint_every: 12
+
+evaluation:
+  fixed_samples: 16
+  fixed_generation_seeds: [1001, 1002, 1003, 1004, 1005, 1006, 1007, 1008]
+  evaluate_before_training: false
+  every_optimizer_steps: 0

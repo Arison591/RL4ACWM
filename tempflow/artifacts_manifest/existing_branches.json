@@ -1,0 +1,10 @@
+{
+  "logical_id": "overfit16-existing-branches-20260815T185747Z",
+  "external_locator": "TEMPFLOW_EXISTING_RUN",
+  "groups": 60,
+  "branches": 360,
+  "size_bytes": 103457742,
+  "metadata_tree_sha256": "76b1fcd4f4178ac15c131ce05f19b941758a36fa9fbc403a2864842ba5293595",
+  "payload_committed": false,
+  "notes": "Existing reward/rollout metadata and MP4s are read-only and remain outside Git."
+}
