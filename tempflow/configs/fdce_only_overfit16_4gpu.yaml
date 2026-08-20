@@ -1,0 +1,82 @@
+base_config: ${TEMPFLOW_STANDALONE_ROOT}/configs/psnr_only_overfit224_4gpu.yaml
+output_dir: ${TEMPFLOW_OUTPUT_ROOT}/fdce_only_overfit16_4gpu
+max_optimizer_steps: 12
+
+experiment:
+  name: fdce_only_overfit16_4gpu
+  mode: tempflow_branch_only
+
+dataset:
+  prep_root: ${TEMPFLOW_PREP_ROOT}
+  expected_num_samples: 16
+  include_samples:
+    - 001_task_327_episode_684757
+    - 014_task_356_episode_662981
+    - 027_task_378_episode_648592
+    - 040_task_429_episode_684445
+    - 053_task_440_episode_752932
+    - 066_task_477_episode_725607
+    - 079_task_486_episode_751236
+    - 092_task_509_episode_769456
+    - 150_task_604_episode_854113
+    - 118_task_529_episode_761171
+    - 131_task_566_episode_795349
+    - 141_task_589_episode_872045
+    - 157_task_666_episode_865446
+    - 041_task_429_episode_684455
+    - 183_task_729_episode_870819
+    - 196_task_739_episode_880599
+
+rollout:
+  group_size: 12
+
+tempflow:
+  branch_factor: 12
+  branch_timestep_fractions: [0.2, 0.5, 0.8]
+
+reward:
+  mode: action
+  geometry_enabled: false
+  gt_video_template: ${TEMPFLOW_GT_ROOT}/samples/{condition_id}/head_29_frames.mp4
+  gt_video_templates:
+    head: ${TEMPFLOW_GT_ROOT}/samples/{condition_id}/head_29_frames.mp4
+    hand_left: ${TEMPFLOW_GT_ROOT}/samples/{condition_id}/hand_left_29_frames.mp4
+    hand_right: ${TEMPFLOW_GT_ROOT}/samples/{condition_id}/hand_right_29_frames.mp4
+  generated_fps: 30
+  expected_gt_fps: 30
+  action_metric_weights:
+    fdce: 1.0
+  fdce_scale: 10.0
+  fdce_k: 16
+  fdce_visibility_threshold: 0.5
+  fdce_min_visible_fraction: 0.8
+  fdce_min_common_frames: 1
+  fdce_seed: 0
+  action_weight: 1.0
+  geometry_weight: 0.0
+  min_valid_seeds_per_group: 8
+
+reward_fusion:
+  # Keep the serialized compatibility reward as 1-clip(FDCE/10), but rank
+  # TempFlow branches with -raw_FDCE so errors above 10 px do not collapse.
+  mode: fdce_only_raw_error
+  min_group_std: 1.0e-4
+  advantage_clip: 5.0
+
+training:
+  max_optimizer_steps: 12
+  max_rollout_epochs: 48
+  action_four_group_accumulation: false
+  optimizer_minibatches_per_rollout_epoch: 1
+  num_inner_epochs: 1
+  shuffle_rollout_buffer: false
+  checkpoint_every: 12
+
+evaluation:
+  fixed_samples: 16
+  fixed_generation_seeds: [1001, 1002, 1003, 1004, 1005, 1006, 1007, 1008]
+  evaluate_before_training: false
+  every_optimizer_steps: 0
+
+logging:
+  wandb_mode: online

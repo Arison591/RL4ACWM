@@ -1,0 +1,27 @@
+{
+  "source": "/home/ma-user/modelarts/user-job-dir/code/zepeng/Genie-Envisioner-V1/output/awm_coca_eval/samples/{condition_id}/seed_{1,2,3}/reward.json",
+  "conditions": 16,
+  "rollouts": 48,
+  "finite_fdce": 48,
+  "fdce": {
+    "min": 0.09243517811339502,
+    "mean": 3.8430527343687952,
+    "max": 36.04395925686148
+  },
+  "compatibility_reward": {
+    "mapping": "1 - clip(fdce / 10, 0, 1)",
+    "min": 0.0,
+    "mean": 0.6738703741845024,
+    "max": 0.9907564821886605,
+    "saturated_zero_rollouts": 2
+  },
+  "group_fdce_std": {
+    "groups_with_three_valid_rollouts": 16,
+    "groups_above_1e-4": 16,
+    "min": 0.07206268004468118,
+    "mean": 1.860007246225926,
+    "max": 14.20287144935527
+  },
+  "training_scalar": "-raw_fdce",
+  "note": "Raw negative FDCE is used for TempFlow ranking so compatibility-reward clipping does not collapse FDCE values above 10."
+}

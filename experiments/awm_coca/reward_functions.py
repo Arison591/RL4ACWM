@@ -209,7 +209,11 @@ def action_metrics_to_reward(
     total_weight = sum(float(weights.get(key, 0.0)) for key in values)
     if total_weight <= 0:
         return None, {"components": values, "weights": weights, "valid": False, "reason": "metric weights sum to zero"}
-    reward = sum(float(weights.get(key, 0.0)) * float(values[key]) for key in values) / total_weight
+    reward = sum(
+        float(weights.get(key, 0.0)) * float(values[key])
+        for key in values
+        if float(weights.get(key, 0.0)) != 0.0
+    ) / total_weight
     return float(reward), {"components": values, "weights": weights, "valid": True}
 
 

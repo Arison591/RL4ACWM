@@ -17,6 +17,7 @@ from __future__ import annotations
 import os
 import sys
 from contextlib import contextmanager
+from dataclasses import dataclass
 from threading import Lock
 
 import numpy as np
@@ -129,12 +130,85 @@ def _sam3_inference_autocast():
 DEFAULT_EEF_PROMPT = "robot arm"  # 默认 EEF 文本 prompt
 
 
+@dataclass(frozen=True)
+class SAMMaskDiagnostics:
+    """Diagnostics for text-prompt detection and initial-frame recovery."""
+
+    initial_frame_detected: bool
+    recovered_initial_frame: bool
+    recovery_prompt_frame: int | None
+    nonempty_frames_before_recovery: int
+    nonempty_frames_after_recovery: int
+
+
+def _output_mask(output, height: int, width: int) -> np.ndarray:
+    if output is None:
+        return np.zeros((height, width), dtype=bool)
+    binary = output.get("out_binary_masks")
+    if binary is None or len(binary) == 0:
+        return np.zeros((height, width), dtype=bool)
+    return np.asarray(binary).any(axis=0)
+
+
+def _recover_initial_masks(
+    model,
+    inference_state,
+    masks: np.ndarray,
+    *,
+    prompt: str,
+) -> tuple[np.ndarray, int | None]:
+    """Back-propagate the first later text detection when frame 0 is empty.
+
+    Generated rollouts can be blurry in the shared conditioning prefix.  SAM3
+    may discover the arm a few frames later, but FDCE requires a foreground
+    mask on frame 0 because all displacements are anchored there.  Re-prompting
+    on the first detected frame and running the tracker in reverse recovers the
+    missing prefix without borrowing a mask from the reference video.
+    """
+    if bool(masks[0].any()):
+        return masks, None
+    nonempty = np.flatnonzero(masks.reshape(masks.shape[0], -1).any(axis=1))
+    if nonempty.size == 0:
+        return masks, None
+    recovery_frame = int(nonempty[0])
+    if recovery_frame == 0:
+        return masks, None
+
+    frame_idx, output = model.add_prompt(
+        inference_state,
+        frame_idx=recovery_frame,
+        text_str=prompt,
+    )
+    retry_mask = _output_mask(output, masks.shape[1], masks.shape[2])
+    if frame_idx != recovery_frame or not bool(retry_mask.any()):
+        return masks, None
+
+    recovered = masks.copy()
+    recovered[recovery_frame] |= retry_mask
+    for reverse_frame_idx, reverse_output in model.propagate_in_video(
+        inference_state,
+        start_frame_idx=recovery_frame,
+        reverse=True,
+    ):
+        if reverse_frame_idx >= recovery_frame:
+            continue
+        recovered[reverse_frame_idx] |= _output_mask(
+            reverse_output,
+            masks.shape[1],
+            masks.shape[2],
+        )
+    return recovered, recovery_frame if bool(recovered[0].any()) else None
+
+
 def track_masks(
-     video_frames,
+    video_frames,
     prompt: str = DEFAULT_EEF_PROMPT,
     confidence: float = 0.5,
     max_frames: int | None = None,
-) -> np.ndarray:
+    *,
+    recover_initial_frame: bool = True,
+    return_diagnostics: bool = False,
+) -> np.ndarray | tuple[np.ndarray, SAMMaskDiagnostics]:
     """
     纯文本 prompt 的 SAM3 video 分割：不产生首帧 mask，直接以 prompt 驱动全序列分割。
 
@@ -176,21 +250,52 @@ def track_masks(
         W = inference_state["orig_width"]
         masks = np.zeros((inference_state["num_frames"], H, W), dtype=bool)
         for frame_idx, out in model.propagate_in_video(inference_state):
-            if out is None:
-                continue
             # propagate_in_video 产出的是后处理字典（out_obj_ids / out_binary_masks 等），
             # 不是原始 obj_id_to_mask。out_binary_masks: (N,H,W) bool，取或合成单帧 EEF mask
-            masks[frame_idx] |= out["out_binary_masks"].any(axis=0)
+            masks[frame_idx] |= _output_mask(out, H, W)
+
+        initial_frame_detected = bool(masks[0].any())
+        nonempty_before = int(masks.reshape(masks.shape[0], -1).any(axis=1).sum())
+        recovery_frame = None
+        if recover_initial_frame and not initial_frame_detected:
+            masks, recovery_frame = _recover_initial_masks(
+                model,
+                inference_state,
+                masks,
+                prompt=prompt,
+            )
+        nonempty_after = int(masks.reshape(masks.shape[0], -1).any(axis=1).sum())
+
+    diagnostics = SAMMaskDiagnostics(
+        initial_frame_detected=initial_frame_detected,
+        recovered_initial_frame=bool(recovery_frame is not None),
+        recovery_prompt_frame=recovery_frame,
+        nonempty_frames_before_recovery=nonempty_before,
+        nonempty_frames_after_recovery=nonempty_after,
+    )
+    if return_diagnostics:
+        return masks, diagnostics
     return masks
 
 
-def track_gt( video_gt,
+def track_gt(
+    video_gt,
     prompt: str = DEFAULT_EEF_PROMPT,
     confidence: float = 0.0,
     max_frames: int | None = None,
-) -> np.ndarray:
+    *,
+    recover_initial_frame: bool = True,
+    return_diagnostics: bool = False,
+) -> np.ndarray | tuple[np.ndarray, SAMMaskDiagnostics]:
     """GT 视频上的文本 prompt 逐帧分割。"""
-    return track_masks(video_gt, prompt, confidence, max_frames)
+    return track_masks(
+        video_gt,
+        prompt,
+        confidence,
+        max_frames,
+        recover_initial_frame=recover_initial_frame,
+        return_diagnostics=return_diagnostics,
+    )
 
 
 def track_pred(
@@ -198,9 +303,19 @@ def track_pred(
     prompt: str = DEFAULT_EEF_PROMPT,
     confidence: float = 0.0,
     max_frames: int | None = None,
-) -> np.ndarray:
+    *,
+    recover_initial_frame: bool = True,
+    return_diagnostics: bool = False,
+) -> np.ndarray | tuple[np.ndarray, SAMMaskDiagnostics]:
     """Pred 视频上的文本 prompt 逐帧分割（同一 prompt、同一 checkpoint）。"""
-    return track_masks(video_pred, prompt, confidence, max_frames)
+    return track_masks(
+        video_pred,
+        prompt,
+        confidence,
+        max_frames,
+        recover_initial_frame=recover_initial_frame,
+        return_diagnostics=return_diagnostics,
+    )
 
 
 def verify_independent_tracking(video_gt, video_pred, prompt: str = DEFAULT_EEF_PROMPT):

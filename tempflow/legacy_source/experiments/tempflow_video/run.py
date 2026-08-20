@@ -120,6 +120,42 @@ def _numeric_reward_leaves(value: Any, prefix: str = "reward") -> dict[str, floa
     return {}
 
 
+def _training_reward(result: dict[str, Any], config: dict[str, Any]) -> float:
+    """Select a high-is-good scalar for TempFlow group ranking.
+
+    The serialized FDCE reward keeps the legacy ``1-clip(error/10)`` mapping
+    for compatibility.  Training on raw negative FDCE avoids the flat zero
+    region for errors above 10 px while preserving exactly the same ordering.
+    """
+    mode = config.get("reward_fusion", {}).get("mode")
+    if mode == "psnr_only_raw_db":
+        value = result["geometry"]["metrics"]["balanced_psnr_db"]
+    elif mode == "fdce_only_raw_error":
+        raw_fdce = result.get("action_metrics", {}).get("fdce")
+        if raw_fdce is None:
+            raise ValueError("FDCE-only rollout has no raw FDCE metric")
+        value = -float(raw_fdce)
+    else:
+        value = result["total_reward"]
+    value = float(value)
+    if not math.isfinite(value):
+        raise FloatingPointError("terminal training reward is non-finite")
+    return value
+
+
+def _minimum_group_std(config: dict[str, Any]) -> float:
+    fusion = config.get("reward_fusion", {})
+    return float(
+        fusion.get(
+            "min_group_std",
+            fusion.get(
+                "psnr_min_group_std_db",
+                config["tempflow"].get("zero_std_threshold", 1.0e-8),
+            ),
+        )
+    )
+
+
 def _action_component_row(rollout: BranchRollout, training_reward: float) -> dict[str, float | int]:
     """Serialize the reward leaves required for action-component GRPO.
 
@@ -172,9 +208,7 @@ def _build_group_advantages(
     result = standardize_group_rewards(
         [float(row["training_reward"]) for row in rows],
         epsilon=float(config["tempflow"].get("advantage_epsilon", 1.0e-6)),
-        zero_std_threshold=float(config.get("reward_fusion", {}).get(
-            "psnr_min_group_std_db", config["tempflow"].get("zero_std_threshold", 1.0e-8)
-        )),
+        zero_std_threshold=_minimum_group_std(config),
     )
     return result.advantages if not result.zero_std else None, result.metrics(), (
         "zero_std_reward" if result.zero_std else None
@@ -614,14 +648,7 @@ def train(
                 for rollout in rollouts:
                     try:
                         result = reward.score_rollout(rollout, prep_dir=raw.sample_dir)
-                        if config.get("reward_fusion", {}).get("mode") == "psnr_only_raw_db":
-                            training_reward = float(
-                                result["geometry"]["metrics"]["balanced_psnr_db"]
-                            )
-                        else:
-                            training_reward = float(result["total_reward"])
-                        if not math.isfinite(training_reward):
-                            raise FloatingPointError("terminal training reward is non-finite")
+                        training_reward = _training_reward(result, config)
                         rollout.reward["training_reward"] = training_reward
                         rewards.append(training_reward)
                         valid_rollouts.append(rollout)
@@ -941,12 +968,7 @@ def train(
         for rollout in rollouts:
             try:
                 result = reward.score_rollout(rollout, prep_dir=raw.sample_dir)
-                if config.get("reward_fusion", {}).get("mode") == "psnr_only_raw_db":
-                    training_reward = float(result["geometry"]["metrics"]["balanced_psnr_db"])
-                else:
-                    training_reward = float(result["total_reward"])
-                if not math.isfinite(training_reward):
-                    raise FloatingPointError("terminal training reward is non-finite")
+                training_reward = _training_reward(result, config)
                 rollout.reward["training_reward"] = training_reward
                 rewards.append(training_reward)
                 valid_rollouts.append(rollout)
@@ -985,9 +1007,7 @@ def train(
         advantages = standardize_group_rewards(
             [row[1] for row in global_reward_rows],
             epsilon=float(config["tempflow"].get("advantage_epsilon", 1.0e-6)),
-            zero_std_threshold=float(config.get("reward_fusion", {}).get(
-                "psnr_min_group_std_db", config["tempflow"].get("zero_std_threshold", 1.0e-8)
-            )),
+            zero_std_threshold=_minimum_group_std(config),
         )
         group_row = {
             "attempt": attempts,

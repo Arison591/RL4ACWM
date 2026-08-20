@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+from dataclasses import asdict
 from typing import Any
 
 import cv2
@@ -106,6 +107,96 @@ def _aggregate_arm_command_metrics(metrics: list[dict[str, Any]]) -> dict[str, A
     }
 
 
+def _track_sam_pair(
+    gt: np.ndarray,
+    pred: np.ndarray,
+    prompt: str,
+    confidence: float,
+) -> tuple[tuple[np.ndarray, np.ndarray], dict[str, Any]]:
+    gt_masks, gt_diagnostics = sam_tracking.track_gt(
+        gt,
+        prompt,
+        confidence,
+        return_diagnostics=True,
+    )
+    pred_masks, pred_diagnostics = sam_tracking.track_pred(
+        pred,
+        prompt,
+        confidence,
+        return_diagnostics=True,
+    )
+    return (gt_masks, pred_masks), {
+        "reference": asdict(gt_diagnostics),
+        "generated": asdict(pred_diagnostics),
+    }
+
+
+def _fdce_only_metrics(
+    gt: np.ndarray,
+    pred: np.ndarray,
+    *,
+    masks: tuple[np.ndarray, np.ndarray],
+    k: int,
+    fdce_seed: int,
+    visibility_threshold: float,
+    min_visible_fraction: float,
+    min_common_frames: int,
+) -> dict[str, Any]:
+    """Compute FDCE without invoking unrelated IoU, command, or YOLO paths."""
+    if not cowtracker_tracking.cowtracker_ready():
+        return {"fdce": None, "fdce_error": "CoWTracker is not ready", "fdce_valid": False}
+
+    dense_gt = cowtracker_tracking.track_dense(gt)
+    dense_pred = cowtracker_tracking.track_dense(pred)
+    try:
+        bundle, meta = fdce_tracks.build_track_bundle(
+            masks[0],
+            masks[1],
+            dense_gt,
+            dense_pred,
+            k=k,
+            seed=fdce_seed,
+            max_frames=len(gt),
+        )
+        if meta["init_failure"]:
+            return {
+                "fdce": None,
+                "fdce_error": "no foreground anchors survive on frame 0",
+                "fdce_valid": False,
+                "fdce_track_meta": meta,
+            }
+        result = metrics_fdce.foreground_displacement_chamfer_error(
+            bundle["generated_tracks"],
+            bundle["reference_tracks"],
+            bundle["generated_visibility"],
+            bundle["reference_visibility"],
+            visibility_threshold=visibility_threshold,
+            min_visible_fraction=min_visible_fraction,
+            min_common_frames=min_common_frames,
+            return_details=True,
+        )
+    except (ValueError, FloatingPointError) as exc:
+        return {
+            "fdce": None,
+            "fdce_error": f"{type(exc).__name__}: {exc}",
+            "fdce_valid": False,
+        }
+
+    return {
+        "fdce": float(result.score),
+        "fdce_valid": True,
+        # Preserve the legacy key while correcting its meaning: FDCE is one
+        # global foreground score, not one score per robot arm.
+        "fdce_valid_arms": 1,
+        "fdce_generated_to_reference": float(result.generated_to_reference),
+        "fdce_reference_to_generated": float(result.reference_to_generated),
+        "fdce_generated_tracks": int(result.generated_tracks),
+        "fdce_reference_tracks": int(result.reference_tracks),
+        "fdce_valid_pairs": int(result.valid_pairs),
+        "fdce_track_meta": meta,
+    }
+
+
 def _fdce_metrics(
     gt: np.ndarray,
     pred: np.ndarray,
@@ -123,14 +214,18 @@ def _fdce_metrics(
     masks: tuple[np.ndarray, np.ndarray] | None = None,
 ) -> dict[str, Any]:
     """Run the same FDCE metric path as eval_action_following_fdce.py."""
-    if not cowtracker_tracking.cowtracker_ready():
-        return {"fdce": None, "fdce_error": "CoWTracker is not ready"}
     if masks is None:
-        masks = (sam_tracking.track_gt(gt, prompt, confidence), sam_tracking.track_pred(pred, prompt, confidence))
-    dense_gt = cowtracker_tracking.track_dense(gt)
-    dense_pred = cowtracker_tracking.track_dense(pred)
-    results = []
-    af_results = []
+        masks, _ = _track_sam_pair(gt, pred, prompt, confidence)
+    fdce_metrics = _fdce_only_metrics(
+        gt,
+        pred,
+        masks=masks,
+        k=k,
+        fdce_seed=fdce_seed,
+        visibility_threshold=visibility_threshold,
+        min_visible_fraction=min_visible_fraction,
+        min_common_frames=min_common_frames,
+    )
     height, width = pred.shape[1:3]
     diag = float(np.sqrt(height * height + width * width))
     actions = actions[:len(pred)]
@@ -141,27 +236,6 @@ def _fdce_metrics(
         )
         for arm in DEFAULT_ARMS
     }
-    # FDCE is a global foreground-motion metric.  Compute it once; the old
-    # implementation repeated the same bundle for left/right and reported it
-    # as two arm scores even though no arm-specific tracks were used.
-    try:
-        bundle, meta = fdce_tracks.build_track_bundle(
-            masks[0], masks[1], dense_gt, dense_pred, k=k, seed=fdce_seed, max_frames=len(gt)
-        )
-        if not meta["init_failure"]:
-            result = metrics_fdce.foreground_displacement_chamfer_error(
-                bundle["generated_tracks"], bundle["reference_tracks"],
-                bundle["generated_visibility"], bundle["reference_visibility"],
-                visibility_threshold=visibility_threshold,
-                min_visible_fraction=min_visible_fraction,
-                min_common_frames=min_common_frames,
-                return_details=True,
-            )
-            results.append(result.score)
-    except (ValueError, FloatingPointError):
-        # 单条 rollout 跟踪退化（如生成视频里机械臂不可见）不应让训练崩溃。
-        pass
-
     # Action-following must be arm-specific.  A centroid of the merged
     # two-arm mask cannot match both command trajectories: it is bounded below
     # by roughly half the left/right command separation.  YOLO already exposes
@@ -169,8 +243,7 @@ def _fdce_metrics(
     af_results = _arm_specific_action_metrics(pred, command, diag=diag)
     command_metrics = _aggregate_arm_command_metrics(af_results)
     return {
-        "fdce": _finite_mean(results),
-        "fdce_valid_arms": len(results),
+        **fdce_metrics,
         "af_fdce_valid_arms": len(af_results),
         "af_fdce_ate": command_metrics["combined_raw_command_error"],
         "af_fdce_ate_norm": _finite_mean([item.get("af_ate_norm") for item in af_results]),
@@ -223,44 +296,61 @@ def compute_head_reward(
     protocol = None
     if reward_mode in {"action", "joint"}:
         gt, pred, protocol = prepare_video_pair(gt_path, pred_path, max_frames=max_frames)
-        height, width = pred.shape[1:3]
-        masks = (
-            sam_tracking.track_gt(gt, prompt, confidence),
-            sam_tracking.track_pred(pred, prompt, confidence),
-        )
-        sample_metrics = []
-        for arm in DEFAULT_ARMS:
-            sample_metrics.append(compute_all(
-                gt, pred, prompt, arm, height, width, confidence=confidence, masks=masks
-            ))
-        action_metrics = {
-            key: _finite_mean([item.get(key) for item in sample_metrics])
-            for key in ("mean_iou", "ate", "ate_norm", "det_coverage")
+        masks, sam_diagnostics = _track_sam_pair(gt, pred, prompt, confidence)
+        positive_metrics = {
+            key
+            for key, value in (action_metric_weights or {}).items()
+            if float(value) > 0.0
         }
-        if prep_dir is None:
-            raise ValueError("prep_dir is required to compute af_fdce_ate against the action command trajectory")
-        actions = np.load(os.path.join(prep_dir, "actions.npy"))
-        c2w = np.load(os.path.join(prep_dir, "extrinsic_head.npy"))
-        intrinsic = np.load(os.path.join(prep_dir, "intrinsic_head.npy"))
-        action_metrics.update(_fdce_metrics(
-            gt, pred, prompt, confidence,
-            actions=actions, c2w=c2w, intrinsic=intrinsic,
-            k=fdce_k,
-            fdce_seed=fdce_seed,
-            visibility_threshold=fdce_visibility_threshold,
-            min_visible_fraction=fdce_min_visible_fraction,
-            min_common_frames=fdce_min_common_frames,
-            masks=masks,
-        ))
+        fdce_only = positive_metrics == {"fdce"}
+        if fdce_only:
+            action_metrics = _fdce_only_metrics(
+                gt,
+                pred,
+                masks=masks,
+                k=fdce_k,
+                fdce_seed=fdce_seed,
+                visibility_threshold=fdce_visibility_threshold,
+                min_visible_fraction=fdce_min_visible_fraction,
+                min_common_frames=fdce_min_common_frames,
+            )
+        else:
+            height, width = pred.shape[1:3]
+            sample_metrics = []
+            for arm in DEFAULT_ARMS:
+                sample_metrics.append(compute_all(
+                    gt, pred, prompt, arm, height, width, confidence=confidence, masks=masks
+                ))
+            action_metrics = {
+                key: _finite_mean([item.get(key) for item in sample_metrics])
+                for key in ("mean_iou", "ate", "ate_norm", "det_coverage")
+            }
+            if prep_dir is None:
+                raise ValueError("prep_dir is required to compute af_fdce_ate against the action command trajectory")
+            actions = np.load(os.path.join(prep_dir, "actions.npy"))
+            c2w = np.load(os.path.join(prep_dir, "extrinsic_head.npy"))
+            intrinsic = np.load(os.path.join(prep_dir, "intrinsic_head.npy"))
+            action_metrics.update(_fdce_metrics(
+                gt, pred, prompt, confidence,
+                actions=actions, c2w=c2w, intrinsic=intrinsic,
+                k=fdce_k,
+                fdce_seed=fdce_seed,
+                visibility_threshold=fdce_visibility_threshold,
+                min_visible_fraction=fdce_min_visible_fraction,
+                min_common_frames=fdce_min_common_frames,
+                masks=masks,
+            ))
+        action_metrics["sam_mask_diagnostics"] = sam_diagnostics
         action_reward, action_components = action_metrics_to_reward(
             action_metrics,
             metric_weights=action_metric_weights,
             af_fdce_ate_norm_scale=af_fdce_ate_norm_scale,
             fdce_scale=fdce_scale,
         )
-        action_metrics["final_command_component"] = action_components["components"].get(
-            "af_fdce_ate_norm"
-        )
+        if not fdce_only:
+            action_metrics["final_command_component"] = action_components["components"].get(
+                "af_fdce_ate_norm"
+            )
 
     geometry = compute_geometry_reward(
         all_camera_videos=all_camera_videos,
