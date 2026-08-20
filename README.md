@@ -62,3 +62,18 @@ scripts/run_psnr_signal_overfit_4gpu.sh
 
 This uses timestep 2, 12 branches, KL beta 0.01, a 0.005 dB variance floor, two PPO passes per
 frozen-policy group, and train-seed plus held-out-seed evaluation every 10 optimizer steps.
+
+## DA3 Mono reward smoke
+
+The optional DA3 Mono evaluator uses exactly the same three generated/GT videos
+and future frames 4–28 as PSNR, but scores frozen DA3 pseudo-depth instead of
+RGB pixels. Each view is inferred independently and the three robust depth
+errors are averaged; no joint multi-view DA3 inference is used. See
+`docs/12_da3_mono_tempflow.md` for the exact reward and offline model setup.
+
+```bash
+export TEMPFLOW_OVERFIT_CONDITION_ID=<condition-id>
+export DA3_SOURCE_ROOT=/path/to/Depth-Anything-3/src
+export DA3_MODEL_PATH=/path/to/DA3-BASE/snapshots/<revision>
+scripts/run_da3_mono_signal_smoke_4gpu.sh
+```

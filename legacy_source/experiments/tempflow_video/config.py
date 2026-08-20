@@ -104,6 +104,12 @@ def load_tempflow_config(path: str | Path) -> dict[str, Any]:
     ids_file = config["dataset"].get("ids_file")
     if ids_file:
         config["dataset"]["ids_file"] = _repo_path(ids_file)
+    da3_source_root = reward.get("da3_source_root")
+    if da3_source_root:
+        reward["da3_source_root"] = _repo_path(da3_source_root)
+    da3_model_path = reward.get("da3_model_path")
+    if da3_model_path:
+        reward["da3_model_path"] = _repo_path(da3_model_path)
     return config
 
 

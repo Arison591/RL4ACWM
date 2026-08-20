@@ -65,6 +65,27 @@ def _numeric_reward_leaves(value: Any, prefix: str = "reward") -> dict[str, floa
     return {}
 
 
+def _training_reward(config: dict[str, Any], result: dict[str, Any]) -> float:
+    mode = config.get("reward_fusion", {}).get("mode")
+    if mode == "psnr_only_raw_db":
+        return float(result["geometry"]["metrics"]["balanced_psnr_db"])
+    if mode == "da3_mono_only":
+        return float(result["da3_mono"]["reward"])
+    return float(result["total_reward"])
+
+
+def _group_std_threshold(config: dict[str, Any]) -> float:
+    fusion = config.get("reward_fusion", {})
+    if fusion.get("min_group_std") is not None:
+        return float(fusion["min_group_std"])
+    return float(
+        fusion.get(
+            "psnr_min_group_std_db",
+            config["tempflow"].get("zero_std_threshold", 1.0e-8),
+        )
+    )
+
+
 def _make_manifest(
     config: dict[str, Any], run_dir: Path, *, write_files: bool = True
 ) -> dict[str, Any]:
@@ -173,12 +194,7 @@ def evaluate_policy(
             "seed": artifact.seed,
             "policy_version": runtime.policy_version,
             "reward": result,
-            "training_reward": float(
-                result["geometry"]["metrics"]["balanced_psnr_db"]
-                if runtime.config.get("reward_fusion", {}).get("mode")
-                == "psnr_only_raw_db"
-                else total
-            ),
+            "training_reward": _training_reward(runtime.config, result),
         }
         _jsonl(target / "rewards.jsonl", row)
         rows.append(row)
@@ -391,12 +407,7 @@ def train(
                 for rollout in rollouts:
                     try:
                         result = reward.score_rollout(rollout, prep_dir=raw.sample_dir)
-                        if config.get("reward_fusion", {}).get("mode") == "psnr_only_raw_db":
-                            training_reward = float(
-                                result["geometry"]["metrics"]["balanced_psnr_db"]
-                            )
-                        else:
-                            training_reward = float(result["total_reward"])
+                        training_reward = _training_reward(config, result)
                         if not math.isfinite(training_reward):
                             raise FloatingPointError("terminal training reward is non-finite")
                         rollout.reward["training_reward"] = training_reward
@@ -416,7 +427,7 @@ def train(
                 gathered_reward_rows = distributed.gather_objects(local_reward_rows)
                 if any(len(rows) == 0 for rows in gathered_reward_rows):
                     raise RuntimeError(
-                        "at least one rank has no valid PSNR branch; refusing desynchronized update"
+                        "at least one rank has no valid reward branch; refusing desynchronized update"
                     )
                 global_reward_rows = sorted(
                     (row for rows in gathered_reward_rows for row in rows),
@@ -433,12 +444,7 @@ def train(
                 advantages = standardize_group_rewards(
                     [row[1] for row in global_reward_rows],
                     epsilon=float(config["tempflow"].get("advantage_epsilon", 1.0e-6)),
-                    zero_std_threshold=float(
-                        config.get("reward_fusion", {}).get(
-                            "psnr_min_group_std_db",
-                            config["tempflow"].get("zero_std_threshold", 1.0e-8),
-                        )
-                    ),
+                    zero_std_threshold=_group_std_threshold(config),
                 )
                 group_row = {
                     "rollout_epoch": collection_epoch,
@@ -630,10 +636,7 @@ def train(
         for rollout in rollouts:
             try:
                 result = reward.score_rollout(rollout, prep_dir=raw.sample_dir)
-                if config.get("reward_fusion", {}).get("mode") == "psnr_only_raw_db":
-                    training_reward = float(result["geometry"]["metrics"]["balanced_psnr_db"])
-                else:
-                    training_reward = float(result["total_reward"])
+                training_reward = _training_reward(config, result)
                 if not math.isfinite(training_reward):
                     raise FloatingPointError("terminal training reward is non-finite")
                 rollout.reward["training_reward"] = training_reward
@@ -660,7 +663,7 @@ def train(
         ]
         gathered_reward_rows = distributed.gather_objects(local_reward_rows)
         if any(len(rows) == 0 for rows in gathered_reward_rows):
-            raise RuntimeError("at least one rank has no valid PSNR branch; refusing desynchronized update")
+            raise RuntimeError("at least one rank has no valid reward branch; refusing desynchronized update")
         global_reward_rows = sorted(
             (row for rows in gathered_reward_rows for row in rows), key=lambda row: row[0]
         )
@@ -674,9 +677,7 @@ def train(
         advantages = standardize_group_rewards(
             [row[1] for row in global_reward_rows],
             epsilon=float(config["tempflow"].get("advantage_epsilon", 1.0e-6)),
-            zero_std_threshold=float(config.get("reward_fusion", {}).get(
-                "psnr_min_group_std_db", config["tempflow"].get("zero_std_threshold", 1.0e-8)
-            )),
+            zero_std_threshold=_group_std_threshold(config),
         )
         group_row = {
             "attempt": attempts,

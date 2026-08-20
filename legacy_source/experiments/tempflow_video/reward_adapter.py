@@ -21,6 +21,9 @@ class VideoRewardAdapter:
 
     def __init__(self, config: dict[str, Any]) -> None:
         self.config = dict(config)
+        self.evaluator = str(self.config.get("evaluator", "legacy"))
+        if self.evaluator not in {"legacy", "da3_mono"}:
+            raise ValueError(f"unknown reward.evaluator={self.evaluator!r}")
         protocol = self.config.get(
             "time_alignment_protocol", "legacy_frame_index_truncate"
         )
@@ -30,6 +33,11 @@ class VideoRewardAdapter:
                 f"time_alignment_protocol=legacy_frame_index_truncate, got {protocol!r}"
             )
         self.config_sha256 = canonical_reward_config_sha256(self.config)
+        self._da3 = None
+        if self.evaluator == "da3_mono":
+            from experiments.tempflow_video.da3_video_reward import DA3MonoVideoReward
+
+            self._da3 = DA3MonoVideoReward(self.config)
 
     def legacy_kwargs(
         self,
@@ -96,6 +104,11 @@ class VideoRewardAdapter:
         prep_dir: str,
         prediction_dir: str | Path,
     ) -> dict[str, Any]:
+        if self._da3 is not None:
+            return self._da3.score_paths(
+                condition_id=condition_id,
+                prediction_dir=prediction_dir,
+            )
         gt_path, pred_path, kwargs = self.legacy_kwargs(
             condition_id=condition_id,
             prep_dir=prep_dir,
@@ -117,3 +130,12 @@ class VideoRewardAdapter:
             json.dumps(reward, ensure_ascii=False, indent=2), encoding="utf-8"
         )
         return reward
+
+    def load_models_for_preflight(self) -> dict[str, Any]:
+        if self._da3 is None:
+            return {"evaluator": self.evaluator, "model_loaded": False}
+        return {
+            "evaluator": self.evaluator,
+            "model_loaded": True,
+            "model": self._da3.load_model_for_preflight(),
+        }

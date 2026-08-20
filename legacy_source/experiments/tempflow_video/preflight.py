@@ -177,6 +177,22 @@ def run_preflight(config: dict[str, Any], *, load_model: bool = False) -> dict[s
             _require_file(path, f"GT {condition_id}/{camera}", checks)
             gt_videos.append(_validate_video(path))
 
+    reward_cfg = config["reward"]
+    reward_evaluator = str(reward_cfg.get("evaluator", "legacy"))
+    if reward_evaluator == "da3_mono":
+        da3_source = Path(reward_cfg["da3_source_root"])
+        _require_file(
+            da3_source / "depth_anything_3/api.py", "Depth Anything 3 source", checks
+        )
+        da3_model_path = reward_cfg.get("da3_model_path")
+        if not da3_model_path:
+            raise ValueError(
+                "reward.da3_model_path is required for offline DA3 Mono training"
+            )
+        _require_dir(Path(da3_model_path), "DA3-BASE local model snapshot", checks)
+    elif reward_evaluator != "legacy":
+        raise ValueError(f"unknown reward.evaluator={reward_evaluator!r}")
+
     checkpoint_root = Path(config["model"]["checkpoint_root"])
     asset_root = checkpoint_root.parent
     os.environ["AWM_ASSET_ROOT"] = str(asset_root)
@@ -185,11 +201,20 @@ def run_preflight(config: dict[str, Any], *, load_model: bool = False) -> dict[s
     _require_file(cosmos / "text_encoder/model.safetensors.index.json", "Cosmos text encoder", checks)
     _require_file(cosmos / "vae/diffusion_pytorch_model.safetensors", "Cosmos VAE", checks)
     _require_file(cosmos / "scheduler/scheduler_config.json", "Cosmos scheduler", checks)
-    _require_file(checkpoint_root / "sam3.pt", "SAM3 checkpoint", checks)
-    _require_file(checkpoint_root / "yoloworld-EWMBench-v0.1.pt", "YOLO-World checkpoint", checks)
-    _require_file(checkpoint_root / "cowtracker/cowtracker_model.pth", "CoWTracker checkpoint", checks)
-    _require_dir(asset_root / "third_party/sam3", "SAM3 source", checks)
-    _require_dir(asset_root / "third_party/cowtracker", "CoWTracker source", checks)
+    if reward_evaluator == "legacy":
+        _require_file(checkpoint_root / "sam3.pt", "SAM3 checkpoint", checks)
+        _require_file(
+            checkpoint_root / "yoloworld-EWMBench-v0.1.pt",
+            "YOLO-World checkpoint",
+            checks,
+        )
+        _require_file(
+            checkpoint_root / "cowtracker/cowtracker_model.pth",
+            "CoWTracker checkpoint",
+            checks,
+        )
+        _require_dir(asset_root / "third_party/sam3", "SAM3 source", checks)
+        _require_dir(asset_root / "third_party/cowtracker", "CoWTracker source", checks)
 
     output = Path(config["output_dir"])
     output.mkdir(parents=True, exist_ok=True)
@@ -245,6 +270,7 @@ def run_preflight(config: dict[str, Any], *, load_model: bool = False) -> dict[s
             ),
         },
         "reward": {
+            "evaluator": reward_evaluator,
             "mode": config["reward"].get("mode"),
             "time_alignment_protocol": config["reward"]["time_alignment_protocol"],
             "generated_fps": config["reward"]["generated_fps"],
@@ -252,6 +278,8 @@ def run_preflight(config: dict[str, Any], *, load_model: bool = False) -> dict[s
             "action_metric_weights": config["reward"].get("action_metric_weights"),
             "action_weight": config["reward"].get("action_weight"),
             "geometry_weight": config["reward"].get("geometry_weight"),
+            "da3_model_path": config["reward"].get("da3_model_path"),
+            "da3_source_root": config["reward"].get("da3_source_root"),
         },
         "scheduler": _scheduler_report(config),
         "model_loaded": False,
@@ -259,6 +287,7 @@ def run_preflight(config: dict[str, Any], *, load_model: bool = False) -> dict[s
     if load_model:
         from experiments.awm_coca.gesim_runtime import PersistentGeSimRuntime
         from experiments.tempflow_video.policy import ReferencePolicyAdapter, VideoPolicyAdapter
+        from experiments.tempflow_video.reward_adapter import VideoRewardAdapter
 
         torch.cuda.reset_peak_memory_stats()
         runtime = PersistentGeSimRuntime(config, device="cuda")
@@ -281,6 +310,14 @@ def run_preflight(config: dict[str, Any], *, load_model: bool = False) -> dict[s
             "peak_cuda_reserved_bytes": torch.cuda.max_memory_reserved(),
             "reference_frozen": True,
         }
+        reward_adapter = VideoRewardAdapter(config["reward"])
+        report["reward_model"] = reward_adapter.load_models_for_preflight()
+        report["reward_model"]["peak_cuda_allocated_bytes"] = (
+            torch.cuda.max_memory_allocated()
+        )
+        report["reward_model"]["peak_cuda_reserved_bytes"] = (
+            torch.cuda.max_memory_reserved()
+        )
     return report
 
 
