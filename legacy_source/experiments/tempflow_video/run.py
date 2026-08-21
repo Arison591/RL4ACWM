@@ -68,6 +68,84 @@ def _numeric_reward_leaves(value: Any, prefix: str = "reward") -> dict[str, floa
     return {}
 
 
+def _init_wandb_run(
+    config: dict[str, Any], run_dir: Path, *, enabled: bool
+) -> Any | None:
+    if not enabled or os.environ.get("WANDB_MODE", "offline").strip().lower() == "disabled":
+        return None
+    try:
+        import wandb
+
+        mode = os.environ.get("WANDB_MODE", "offline").strip().lower()
+        run = wandb.init(
+            project=os.environ.get("WANDB_PROJECT", "awm-coca"),
+            entity=os.environ.get("WANDB_ENTITY") or None,
+            name=os.environ.get("WANDB_NAME")
+            or f"{config.get('experiment', {}).get('name', 'tempflow')}-{run_dir.name}",
+            mode=mode,
+            dir=str(run_dir),
+            config={
+                "experiment": config.get("experiment", {}),
+                "training": config.get("training", {}),
+                "optimizer": config.get("optimizer", {}),
+                "reward": config.get("reward", {}),
+                "reward_fusion": config.get("reward_fusion", {}),
+                "tempflow": config.get("tempflow", {}),
+                "distributed": config.get("distributed", {}),
+            },
+            resume="never",
+        )
+        if run is None:
+            raise RuntimeError("wandb.init returned None")
+        url = getattr(run, "url", None) or "offline"
+        status = {
+            "status": "active",
+            "mode": mode,
+            "project": getattr(run, "project", None),
+            "run_id": getattr(run, "id", None),
+            "url": url,
+        }
+        (run_dir / "wandb_run.json").write_text(
+            json.dumps(status, ensure_ascii=False, indent=2), encoding="utf-8"
+        )
+        print(f"W&B initialized: project={run.project}, id={run.id}, url={url}", flush=True)
+        return run
+    except Exception as exc:
+        raise RuntimeError(f"W&B initialization failed: {exc}") from exc
+
+
+def _wandb_log(run: Any | None, payload: dict[str, Any], *, step: int) -> None:
+    if run is None:
+        return
+    values = _numeric_reward_leaves(payload)
+    values["trainer/optimizer_step"] = float(step)
+    run.log(values, step=int(step))
+
+
+def _wandb_eval_payload(summary: dict[str, Any]) -> dict[str, float]:
+    payload = {
+        f"eval/{key}": float(summary[key])
+        for key in (
+            "reward_mean",
+            "reward_std",
+            "training_reward_mean",
+            "training_reward_std",
+        )
+        if key in summary and math.isfinite(float(summary[key]))
+    }
+    statistics = summary.get("component_statistics", {})
+    selected = {
+        "reward.geometry.metrics.balanced_psnr_db": "eval/balanced_psnr_db",
+        "reward.sobel.score": "eval/sobel_score",
+        "reward.sobel.balanced_error": "eval/sobel_error",
+    }
+    for source, target in selected.items():
+        value = statistics.get(source, {}).get("mean")
+        if value is not None and math.isfinite(float(value)):
+            payload[target] = float(value)
+    return payload
+
+
 def _training_reward_components(
     result: dict[str, Any], config: dict[str, Any]
 ) -> dict[str, float]:
@@ -348,6 +426,7 @@ def train(
         runtime.set_policy_version(trainer.policy_version)
 
     reward = VideoRewardAdapter(config["reward"])
+    wandb_run = _init_wandb_run(config, run_dir, enabled=distributed.is_main)
     sampler_class = TempFlowBranchSampler if branching else FlowGRPOVideoSampler
     sampler = sampler_class(
         runtime,
@@ -392,6 +471,11 @@ def train(
                 tag="policy_00000000_baseline",
             )
             _jsonl(run_dir / "evaluation_history.jsonl", baseline)
+            _wandb_log(
+                wandb_run,
+                _wandb_eval_payload(baseline),
+                step=trainer.optimizer_step,
+            )
         distributed.barrier()
 
     if branching:
@@ -523,6 +607,7 @@ def train(
                     group_row["excluded_from_optimizer"] = True
                     if distributed.is_main:
                         _jsonl(run_dir / "rollout_groups.jsonl", group_row)
+                        _wandb_log(wandb_run, group_row, step=trainer.optimizer_step)
                     rollout_group_rows.append(group_row)
                     continue
                 advantage_clip = float(
@@ -545,6 +630,7 @@ def train(
                 group_row["excluded_from_optimizer"] = False
                 if distributed.is_main:
                     _jsonl(run_dir / "rollout_groups.jsonl", group_row)
+                    _wandb_log(wandb_run, group_row, step=trainer.optimizer_step)
                 rollout_group_rows.append(group_row)
                 rollout_buffer.append(valid_rollouts)
                 global_group_sizes.append(len(global_reward_rows))
@@ -605,6 +691,7 @@ def train(
                 if distributed.is_main:
                     _jsonl(run_dir / "optimizer_steps.jsonl", step_row)
                     print(json.dumps(step_row, ensure_ascii=False, default=str), flush=True)
+                    _wandb_log(wandb_run, step_row, step=record.optimizer_step)
 
             checkpoint_due = (
                 trainer.optimizer_step // checkpoint_every
@@ -645,12 +732,19 @@ def train(
                         tag=f"policy_{runtime.policy_version:08d}",
                     )
                     _jsonl(run_dir / "evaluation_history.jsonl", summary)
+                    _wandb_log(
+                        wandb_run,
+                        _wandb_eval_payload(summary),
+                        step=trainer.optimizer_step,
+                    )
                 distributed.barrier()
         if trainer.optimizer_step < target_steps:
             raise RuntimeError(
                 f"only completed {trainer.optimizer_step}/{target_steps} optimizer steps after "
                 f"{trainer.rollout_epoch} rollout epochs"
             )
+        if wandb_run is not None:
+            wandb_run.finish()
         return
 
     timesteps = [int(value) for value in config["tempflow"].get("branch_timesteps", ())]
