@@ -4,6 +4,11 @@ output_dir: ${TEMPFLOW_OUTPUT_ROOT}/psnr_sobel_signal_overfit_4gpu
 experiment:
   name: psnr_sobel_signal_overfit_4gpu
 
+optimizer:
+  learning_rate: 1.0e-5
+  reference_kl_beta: 0.5
+  ppo_ratio_mode: scalar_mean
+
 reward:
   # Edge supervision uses the same three views and future-frame interval as PSNR.
   sobel_enabled: true
