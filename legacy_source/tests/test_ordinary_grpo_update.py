@@ -24,6 +24,7 @@ def test_ordinary_multistep_grpo_updates_policy(tmp_path: Path):
             next_flow_time=item.next_flow_time,
             eta=item.eta,
             old_log_prob=item.old_log_prob,
+            old_token_log_prob=item.old_token_log_prob,
             rf_noise_std=item.rf_noise_std,
             noise_weight=item.noise_weight,
             noise_seed=item.branch_noise_seed,

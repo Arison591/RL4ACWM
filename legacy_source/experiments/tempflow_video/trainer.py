@@ -41,6 +41,7 @@ class TempFlowOptimizerConfig:
     warmup_steps: int = 0
     log_term_grad_norm: bool = True
     log_gradient_cosine: bool = False
+    ppo_ratio_mode: str = "scalar_mean"
 
 
 class TempFlowVideoTrainer:
@@ -56,6 +57,8 @@ class TempFlowVideoTrainer:
         self.policy = policy
         self.reference = reference
         self.config = config
+        if config.ppo_ratio_mode not in {"scalar_mean", "latent_token_channel_mean"}:
+            raise ValueError(f"unknown PPO ratio mode: {config.ppo_ratio_mode}")
         self.gradient_reducer = gradient_reducer
         self.parameters = policy.get_trainable_parameters()
         self.optimizer = torch.optim.AdamW(
@@ -174,11 +177,24 @@ class TempFlowVideoTrainer:
                         next_flow_time=action.next_flow_time,
                         eta=action.eta,
                     )
-                output = tempflow_grpo_loss(
-                    log_probs=transition.log_prob.mean().reshape(1),
-                    old_log_probs=torch.tensor(
+                if self.config.ppo_ratio_mode == "latent_token_channel_mean":
+                    log_probs = transition.token_log_prob.reshape(-1)
+                    old_log_probs = action.old_token_log_prob.to(
+                        current.device, dtype=torch.float32
+                    ).reshape(-1)
+                    if log_probs.shape != old_log_probs.shape:
+                        raise ValueError(
+                            "new/old token log-probability shape mismatch: "
+                            f"{tuple(log_probs.shape)} != {tuple(old_log_probs.shape)}"
+                        )
+                else:
+                    log_probs = transition.log_prob.mean().reshape(1)
+                    old_log_probs = torch.tensor(
                         [action.old_log_prob], device=current.device, dtype=torch.float32
-                    ),
+                    )
+                output = tempflow_grpo_loss(
+                    log_probs=log_probs,
+                    old_log_probs=old_log_probs,
                     advantages=torch.tensor(
                         [float(rollout.advantage)], device=current.device, dtype=torch.float32
                     ),

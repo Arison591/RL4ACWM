@@ -1,32 +1,45 @@
 base_config: ${TEMPFLOW_STANDALONE_ROOT}/configs/psnr_only_overfit224_4gpu.yaml
-output_dir: ${TEMPFLOW_OUTPUT_ROOT}/psnr_signal_overfit_4gpu
+output_dir: ${TEMPFLOW_OUTPUT_ROOT}/action_signal_fixed_4gpu
 max_optimizer_steps: 100
 
 experiment:
-  name: psnr_signal_overfit_4gpu
+  name: action_signal_fixed_4gpu
+  mode: tempflow_full
 
 dataset:
-  # Choose one ID from awm_coca_overfit16_ids.txt before launching.
   include_samples: ["${TEMPFLOW_OVERFIT_CONDITION_ID}"]
   expected_num_samples: 1
   limit: 0
+
+model:
+  checkpoint_root: ${TEMPFLOW_MODEL_ROOT}
 
 rollout:
   group_size: 12
 
 tempflow:
   branch_factor: 12
-  # The old run shows useful reward spread here without the late-step noise floor.
   branch_timesteps: [2]
 
 optimizer:
-  # Match the TempFlow-GRPO released base configuration.
   learning_rate: 3.0e-4
   reference_kl_beta: 0.5
   ppo_ratio_mode: scalar_mean
   log_gradient_cosine: true
 
+reward:
+  mode: action
+  geometry_enabled: false
+  action_metric_weights:
+    mean_iou: 0.1
+    af_fdce_ate_norm: 0.7
+    fdce: 0.2
+  action_weight: 1.0
+  geometry_weight: 0.0
+  min_valid_seeds_per_group: 2
+
 reward_fusion:
+  mode: action_only
   advantage_clip: 5.0
   psnr_min_group_std_db: 0.005
 
@@ -34,15 +47,12 @@ training:
   max_optimizer_steps: 100
   max_rollout_epochs: 100
   optimizer_minibatches_per_rollout_epoch: 1
-  # Reuse each frozen-policy group twice. The second pass is what makes the
-  # PPO ratio/clipping observable instead of identically ratio=1.
   num_inner_epochs: 2
   shuffle_rollout_buffer: false
   checkpoint_every: 10
 
 evaluation:
   fixed_samples: 1
-  # First is the training generation seed; second is held out.
   fixed_generation_seeds: [123456, 12345678]
-  evaluate_before_training: true
-  every_optimizer_steps: 10
+  evaluate_before_training: false
+  every_optimizer_steps: 0

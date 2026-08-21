@@ -64,6 +64,7 @@ def make_toy_rollouts(policy, tmp_path: Path):
             next_flow_time=0.5,
             eta=0.7,
             old_log_prob=float(transition.log_prob.mean().item()),
+            old_token_log_prob=transition.token_log_prob.detach().clone(),
             rf_noise_std=float(transition.rf_noise_std.item()),
             noise_weight=1.0,
             prefix_latent_sha256="same-prefix",

@@ -67,8 +67,9 @@ class DistributedContext:
                     f"distributed TempFlow needs {world_size} visible CUDA devices, "
                     f"found {torch.cuda.device_count()}"
                 )
-            torch.cuda.set_device(local_rank)
-            dist.init_process_group(backend="nccl", init_method="env://")
+            device = torch.device(f"cuda:{local_rank}")
+            torch.cuda.set_device(device)
+            dist.init_process_group(backend="nccl", init_method="env://", device_id=device)
         elif torch.cuda.is_available():
             torch.cuda.set_device(local_rank)
         return cls(rank=rank, local_rank=local_rank, world_size=world_size, enabled=enabled)
@@ -83,7 +84,7 @@ class DistributedContext:
 
     def barrier(self) -> None:
         if self.enabled:
-            dist.barrier()
+            dist.barrier(device_ids=[self.local_rank])
 
     def broadcast_path(self, value: Path | None) -> Path:
         payload: list[Any] = [None if value is None else str(value)]
@@ -108,5 +109,5 @@ class DistributedContext:
 
     def close(self) -> None:
         if self.enabled and dist.is_initialized():
-            dist.barrier()
+            dist.barrier(device_ids=[self.local_rank])
             dist.destroy_process_group()
