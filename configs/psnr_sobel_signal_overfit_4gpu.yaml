@@ -19,11 +19,11 @@ reward_fusion:
   lambda_psnr: 0.80
   lambda_sobel: 0.20
 
-  # null = use this rollout group's population std, clipped by the floor.
-  # After collecting representative base-policy groups, replace null with the
-  # median logged fusion_*_group_std value to freeze reward semantics.
-  psnr_scale_db: null
-  sobel_scale: null
+  # Fixed from five 12-rollout validation groups on the overfit condition.
+  # Observed median stds were 0.2445 dB (PSNR) and 0.0004395 (Sobel);
+  # Sobel keeps the validated noise floor instead of amplifying sub-floor spread.
+  psnr_scale_db: 0.25
+  sobel_scale: 0.0005
   psnr_scale_floor_db: 0.005
   sobel_scale_floor: 0.0005
   fused_min_group_std: 1.0e-8
