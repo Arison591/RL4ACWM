@@ -77,9 +77,12 @@ def _init_wandb_run(
         import wandb
 
         mode = os.environ.get("WANDB_MODE", "offline").strip().lower()
+        run_id = os.environ.get("WANDB_RUN_ID") or None
+        resume = os.environ.get("WANDB_RESUME") or ("must" if run_id else "never")
         run = wandb.init(
             project=os.environ.get("WANDB_PROJECT", "awm-coca"),
             entity=os.environ.get("WANDB_ENTITY") or None,
+            id=run_id,
             name=os.environ.get("WANDB_NAME")
             or f"{config.get('experiment', {}).get('name', 'tempflow')}-{run_dir.name}",
             mode=mode,
@@ -93,7 +96,7 @@ def _init_wandb_run(
                 "tempflow": config.get("tempflow", {}),
                 "distributed": config.get("distributed", {}),
             },
-            resume="never",
+            resume=resume,
         )
         if run is None:
             raise RuntimeError("wandb.init returned None")

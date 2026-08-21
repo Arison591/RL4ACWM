@@ -37,6 +37,26 @@ def test_wandb_init_writes_auditable_status(monkeypatch, tmp_path):
     assert status["url"] == fake_run.url
 
 
+def test_wandb_init_resumes_explicit_run(monkeypatch, tmp_path):
+    fake_run = _FakeRun()
+    captured = {}
+
+    def fake_init(**kwargs):
+        captured.update(kwargs)
+        return fake_run
+
+    monkeypatch.setitem(sys.modules, "wandb", SimpleNamespace(init=fake_init))
+    monkeypatch.setenv("WANDB_MODE", "online")
+    monkeypatch.setenv("WANDB_RUN_ID", "test-run")
+    monkeypatch.setenv("WANDB_RESUME", "must")
+
+    result = _init_wandb_run({}, tmp_path, enabled=True)
+
+    assert result is fake_run
+    assert captured["id"] == "test-run"
+    assert captured["resume"] == "must"
+
+
 def test_wandb_group_logging_flattens_numeric_metrics():
     run = _FakeRun()
 
