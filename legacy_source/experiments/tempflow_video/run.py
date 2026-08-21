@@ -15,7 +15,10 @@ import torch
 
 from experiments.awm_coca.condition_dataset import PrepConditionDataset, build_manifest, write_manifest
 from experiments.awm_coca.gesim_runtime import DEFAULT_PROMPT, PersistentGeSimRuntime
-from experiments.tempflow_video.advantage import standardize_group_rewards
+from experiments.tempflow_video.advantage import (
+    fuse_psnr_sobel_rewards,
+    standardize_group_rewards,
+)
 from experiments.tempflow_video.checkpointing import (
     load_tempflow_checkpoint,
     restore_tempflow_checkpoint,
@@ -63,6 +66,63 @@ def _numeric_reward_leaves(value: Any, prefix: str = "reward") -> dict[str, floa
     if isinstance(value, (int, float)) and math.isfinite(float(value)):
         return {prefix: float(value)}
     return {}
+
+
+def _training_reward_components(
+    result: dict[str, Any], config: dict[str, Any]
+) -> dict[str, float]:
+    mode = config.get("reward_fusion", {}).get("mode")
+    if mode in {"psnr_only_raw_db", "psnr_sobel"}:
+        psnr = float(result["geometry"]["metrics"]["balanced_psnr_db"])
+        if mode == "psnr_only_raw_db":
+            return {"scalar": psnr}
+        sobel = float(result["sobel"]["score"])
+        if not math.isfinite(psnr) or not math.isfinite(sobel):
+            raise FloatingPointError("PSNR/Sobel training components must be finite")
+        return {"psnr_db": psnr, "sobel_score": sobel}
+    total = float(result["total_reward"])
+    if not math.isfinite(total):
+        raise FloatingPointError("terminal training reward is non-finite")
+    return {"scalar": total}
+
+
+def _fuse_training_reward_rows(
+    rows: list[tuple[int, dict[str, float]]], config: dict[str, Any]
+) -> tuple[list[tuple[int, float]], dict[str, Any]]:
+    fusion = config.get("reward_fusion", {})
+    if fusion.get("mode") != "psnr_sobel":
+        return [(member_id, float(values["scalar"])) for member_id, values in rows], {}
+    fused, metrics = fuse_psnr_sobel_rewards(
+        [values["psnr_db"] for _, values in rows],
+        [values["sobel_score"] for _, values in rows],
+        psnr_weight=float(fusion.get("lambda_psnr", 0.8)),
+        sobel_weight=float(fusion.get("lambda_sobel", 0.2)),
+        psnr_scale=fusion.get("psnr_scale_db"),
+        sobel_scale=fusion.get("sobel_scale"),
+        psnr_scale_floor=float(fusion.get("psnr_scale_floor_db", 0.005)),
+        sobel_scale_floor=float(fusion.get("sobel_scale_floor", 0.0005)),
+    )
+    return [
+        (member_id, float(value))
+        for (member_id, _), value in zip(rows, fused.tolist(), strict=True)
+    ], {f"fusion_{key}": value for key, value in metrics.items()}
+
+
+def _group_zero_std_threshold(config: dict[str, Any]) -> float:
+    fusion = config.get("reward_fusion", {})
+    if fusion.get("mode") == "psnr_sobel":
+        return float(
+            fusion.get(
+                "fused_min_group_std",
+                config["tempflow"].get("zero_std_threshold", 1.0e-8),
+            )
+        )
+    return float(
+        fusion.get(
+            "psnr_min_group_std_db",
+            config["tempflow"].get("zero_std_threshold", 1.0e-8),
+        )
+    )
 
 
 def _make_manifest(
@@ -174,15 +234,29 @@ def evaluate_policy(
             "seed": artifact.seed,
             "policy_version": runtime.policy_version,
             "reward": result,
-            "training_reward": float(
-                result["geometry"]["metrics"]["balanced_psnr_db"]
-                if runtime.config.get("reward_fusion", {}).get("mode")
-                == "psnr_only_raw_db"
-                else total
+            "training_reward_components": _training_reward_components(
+                result, runtime.config
             ),
         }
-        _jsonl(target / "rewards.jsonl", row)
         rows.append(row)
+    # Evaluation seeds for one condition form the same comparison group as
+    # training branches. This also records the exact scales used for auditing.
+    for condition_id in sorted({row["condition_id"] for row in rows}):
+        indices = [
+            index for index, row in enumerate(rows) if row["condition_id"] == condition_id
+        ]
+        reward_rows, fusion_metrics = _fuse_training_reward_rows(
+            [
+                (index, rows[index]["training_reward_components"])
+                for index in indices
+            ],
+            runtime.config,
+        )
+        for index, value in reward_rows:
+            rows[index]["training_reward"] = value
+            rows[index]["reward_fusion_metrics"] = fusion_metrics
+    for row in rows:
+        _jsonl(target / "rewards.jsonl", row)
     totals = [float(row["reward"]["total_reward"]) for row in rows]
     training_totals = [float(row["training_reward"]) for row in rows]
     leaf_rows = [_numeric_reward_leaves(row["reward"]) for row in rows]
@@ -387,21 +461,14 @@ def train(
                     raise RuntimeError(
                         "deterministic TempFlow prefix differs across ranks; refusing a mixed group"
                     )
-                rewards = []
+                reward_components = []
                 valid_rollouts = []
                 for rollout in rollouts:
                     try:
                         result = reward.score_rollout(rollout, prep_dir=raw.sample_dir)
-                        if config.get("reward_fusion", {}).get("mode") == "psnr_only_raw_db":
-                            training_reward = float(
-                                result["geometry"]["metrics"]["balanced_psnr_db"]
-                            )
-                        else:
-                            training_reward = float(result["total_reward"])
-                        if not math.isfinite(training_reward):
-                            raise FloatingPointError("terminal training reward is non-finite")
-                        rollout.reward["training_reward"] = training_reward
-                        rewards.append(training_reward)
+                        components = _training_reward_components(result, config)
+                        rollout.reward["training_reward_components"] = components
+                        reward_components.append(components)
                         valid_rollouts.append(rollout)
                     except Exception as exc:
                         _jsonl(
@@ -411,17 +478,20 @@ def train(
                 minimum = int(config["reward"].get("min_valid_seeds_per_group", 2))
                 trainer.group_attempts += 1
                 local_reward_rows = [
-                    (int(rollout.branch_id), float(value))
-                    for rollout, value in zip(valid_rollouts, rewards)
+                    (int(rollout.branch_id), values)
+                    for rollout, values in zip(valid_rollouts, reward_components)
                 ]
                 gathered_reward_rows = distributed.gather_objects(local_reward_rows)
                 if any(len(rows) == 0 for rows in gathered_reward_rows):
                     raise RuntimeError(
                         "at least one rank has no valid PSNR branch; refusing desynchronized update"
                     )
-                global_reward_rows = sorted(
+                global_component_rows = sorted(
                     (row for rows in gathered_reward_rows for row in rows),
                     key=lambda row: row[0],
+                )
+                global_reward_rows, fusion_metrics = _fuse_training_reward_rows(
+                    global_component_rows, config
                 )
                 global_ids = [row[0] for row in global_reward_rows]
                 if len(global_ids) != len(set(global_ids)):
@@ -434,12 +504,7 @@ def train(
                 advantages = standardize_group_rewards(
                     [row[1] for row in global_reward_rows],
                     epsilon=float(config["tempflow"].get("advantage_epsilon", 1.0e-6)),
-                    zero_std_threshold=float(
-                        config.get("reward_fusion", {}).get(
-                            "psnr_min_group_std_db",
-                            config["tempflow"].get("zero_std_threshold", 1.0e-8),
-                        )
-                    ),
+                    zero_std_threshold=_group_zero_std_threshold(config),
                 )
                 group_row = {
                     "rollout_epoch": collection_epoch,
@@ -451,6 +516,7 @@ def train(
                     "collection_policy_version": collection_policy_version,
                     "world_size": distributed.world_size,
                     "branches_per_rank": [len(rows) for rows in gathered_reward_rows],
+                    **fusion_metrics,
                     **advantages.metrics(),
                 }
                 if advantages.zero_std:
@@ -463,7 +529,11 @@ def train(
                     config.get("reward_fusion", {}).get("advantage_clip", float("inf"))
                 )
                 advantage_by_id = dict(zip(global_ids, advantages.advantages.tolist()))
+                training_reward_by_id = dict(global_reward_rows)
                 for rollout in valid_rollouts:
+                    rollout.reward["training_reward"] = training_reward_by_id[
+                        int(rollout.branch_id)
+                    ]
                     advantage = advantage_by_id[int(rollout.branch_id)]
                     rollout.advantage = float(
                         max(-advantage_clip, min(advantage_clip, advantage))
@@ -626,19 +696,14 @@ def train(
                 group_sequence=attempts,
                 **{**common_sampling, "output_dir": rank_output},
             )
-        rewards = []
+        reward_components = []
         valid_rollouts = []
         for rollout in rollouts:
             try:
                 result = reward.score_rollout(rollout, prep_dir=raw.sample_dir)
-                if config.get("reward_fusion", {}).get("mode") == "psnr_only_raw_db":
-                    training_reward = float(result["geometry"]["metrics"]["balanced_psnr_db"])
-                else:
-                    training_reward = float(result["total_reward"])
-                if not math.isfinite(training_reward):
-                    raise FloatingPointError("terminal training reward is non-finite")
-                rollout.reward["training_reward"] = training_reward
-                rewards.append(training_reward)
+                components = _training_reward_components(result, config)
+                rollout.reward["training_reward_components"] = components
+                reward_components.append(components)
                 valid_rollouts.append(rollout)
             except Exception as exc:
                 _jsonl(
@@ -655,15 +720,18 @@ def train(
                     if isinstance(rollout, BranchRollout)
                     else rollout.rollout_id
                 ),
-                float(value),
+                values,
             )
-            for rollout, value in zip(valid_rollouts, rewards)
+            for rollout, values in zip(valid_rollouts, reward_components)
         ]
         gathered_reward_rows = distributed.gather_objects(local_reward_rows)
         if any(len(rows) == 0 for rows in gathered_reward_rows):
             raise RuntimeError("at least one rank has no valid PSNR branch; refusing desynchronized update")
-        global_reward_rows = sorted(
+        global_component_rows = sorted(
             (row for rows in gathered_reward_rows for row in rows), key=lambda row: row[0]
+        )
+        global_reward_rows, fusion_metrics = _fuse_training_reward_rows(
+            global_component_rows, config
         )
         global_ids = [row[0] for row in global_reward_rows]
         if len(global_ids) != len(set(global_ids)):
@@ -675,9 +743,7 @@ def train(
         advantages = standardize_group_rewards(
             [row[1] for row in global_reward_rows],
             epsilon=float(config["tempflow"].get("advantage_epsilon", 1.0e-6)),
-            zero_std_threshold=float(config.get("reward_fusion", {}).get(
-                "psnr_min_group_std_db", config["tempflow"].get("zero_std_threshold", 1.0e-8)
-            )),
+            zero_std_threshold=_group_zero_std_threshold(config),
         )
         group_row = {
             "attempt": attempts,
@@ -685,6 +751,7 @@ def train(
             "branch_timestep": branch_timestep,
             "policy_version": runtime.policy_version,
             "elapsed_seconds_before_update": time.monotonic() - started,
+            **fusion_metrics,
             **advantages.metrics(),
         }
         if advantages.zero_std:
@@ -694,12 +761,14 @@ def train(
             continue
         advantage_clip = float(config.get("reward_fusion", {}).get("advantage_clip", float("inf")))
         advantage_by_id = dict(zip(global_ids, advantages.advantages.tolist()))
+        training_reward_by_id = dict(global_reward_rows)
         for rollout in valid_rollouts:
             member_id = (
                 rollout.branch_id
                 if isinstance(rollout, BranchRollout)
                 else rollout.rollout_id
             )
+            rollout.reward["training_reward"] = training_reward_by_id[int(member_id)]
             advantage = advantage_by_id[int(member_id)]
             rollout.advantage = float(max(-advantage_clip, min(advantage_clip, advantage)))
             (rollout.seed_dir / "rollout.json").write_text(

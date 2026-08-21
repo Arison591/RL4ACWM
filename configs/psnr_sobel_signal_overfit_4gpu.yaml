@@ -1,0 +1,25 @@
+base_config: ${TEMPFLOW_STANDALONE_ROOT}/configs/psnr_signal_overfit_4gpu.yaml
+output_dir: ${TEMPFLOW_OUTPUT_ROOT}/psnr_sobel_signal_overfit_4gpu
+
+experiment:
+  name: psnr_sobel_signal_overfit_4gpu
+
+reward:
+  # Edge supervision uses the same three views and future-frame interval as PSNR.
+  sobel_enabled: true
+  sobel_charbonnier_epsilon: 0.001
+
+reward_fusion:
+  mode: psnr_sobel
+  lambda_psnr: 0.80
+  lambda_sobel: 0.20
+
+  # null = use this rollout group's population std, clipped by the floor.
+  # After collecting representative base-policy groups, replace null with the
+  # median logged fusion_*_group_std value to freeze reward semantics.
+  psnr_scale_db: null
+  sobel_scale: null
+  psnr_scale_floor_db: 0.005
+  sobel_scale_floor: 0.0005
+  fused_min_group_std: 1.0e-8
+  advantage_clip: 5.0
