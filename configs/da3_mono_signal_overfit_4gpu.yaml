@@ -1,0 +1,39 @@
+base_config: ${TEMPFLOW_STANDALONE_ROOT}/configs/psnr_signal_overfit_4gpu.yaml
+output_dir: ${TEMPFLOW_OUTPUT_ROOT}/da3_mono_signal_overfit_4gpu
+max_optimizer_steps: 100
+
+experiment:
+  name: da3_mono_signal_overfit_4gpu
+
+reward:
+  evaluator: da3_mono
+  da3_source_root: ${DA3_SOURCE_ROOT}
+  da3_model_path: ${DA3_MODEL_PATH}
+  da3_device: cuda
+  da3_process_res: 336
+  da3_process_res_method: upper_bound_resize
+  da3_representation: inverse
+  da3_alignment: affine
+  da3_alignment_scope: view_clip
+  da3_loss: huber
+  da3_trim_fraction: 0.05
+  da3_huber_delta_scale: 0.10
+  da3_confidence_mode: soft
+  da3_border_fraction: 0.02
+  da3_dynamic_weight: 0.35
+
+reward_fusion:
+  mode: da3_mono_only
+  # The five completed 12-branch smoke groups had std 0.00239-0.00378.
+  min_group_std: 1.0e-5
+
+training:
+  max_optimizer_steps: 100
+  max_rollout_epochs: 100
+  checkpoint_every: 10
+
+evaluation:
+  fixed_samples: 1
+  fixed_generation_seeds: [123456, 12345678]
+  evaluate_before_training: true
+  every_optimizer_steps: 10

@@ -48,7 +48,7 @@ mkdir -p "${TEMPFLOW_OUTPUT_ROOT}"
 export PYTHONPATH="${repo_root}/legacy_source:${AWM_UPSTREAM_ROOT}:${repo_root}/src${PYTHONPATH:+:${PYTHONPATH}}"
 export WANDB_MODE="${WANDB_MODE:-offline}"
 export OMP_NUM_THREADS="${OMP_NUM_THREADS:-1}"
-export NCCL_ASYNC_ERROR_HANDLING="${NCCL_ASYNC_ERROR_HANDLING:-1}"
+export TORCH_NCCL_ASYNC_ERROR_HANDLING="${TORCH_NCCL_ASYNC_ERROR_HANDLING:-1}"
 export TEMPFLOW_STANDALONE_ROOT="${repo_root}"
 
 exec "${TORCHRUN_BIN:-torchrun}" \

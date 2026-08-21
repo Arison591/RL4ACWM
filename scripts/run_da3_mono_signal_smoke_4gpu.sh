@@ -20,5 +20,5 @@ fi
 
 export HF_HUB_OFFLINE=1
 export TRANSFORMERS_OFFLINE=1
-export TEMPFLOW_CONFIG="${repo_root}/configs/da3_mono_signal_smoke_4gpu.yaml"
+export TEMPFLOW_CONFIG="${TEMPFLOW_CONFIG:-${repo_root}/configs/da3_mono_signal_smoke_4gpu.yaml}"
 exec "${repo_root}/scripts/run_psnr_only_4gpu.sh" "$@"

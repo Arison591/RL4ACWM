@@ -68,7 +68,15 @@ class DistributedContext:
                     f"found {torch.cuda.device_count()}"
                 )
             torch.cuda.set_device(local_rank)
-            dist.init_process_group(backend="nccl", init_method="env://")
+            # Explicitly bind NCCL to the torchrun local rank. Without this,
+            # newer PyTorch versions warn that the device mapping is unknown
+            # and may block at the first collective when CUDA_VISIBLE_DEVICES
+            # exposes a non-zero physical GPU range (for example 4,5,6,7).
+            dist.init_process_group(
+                backend="nccl",
+                init_method="env://",
+                device_id=torch.device(f"cuda:{local_rank}"),
+            )
         elif torch.cuda.is_available():
             torch.cuda.set_device(local_rank)
         return cls(rank=rank, local_rank=local_rank, world_size=world_size, enabled=enabled)
@@ -83,7 +91,7 @@ class DistributedContext:
 
     def barrier(self) -> None:
         if self.enabled:
-            dist.barrier()
+            dist.barrier(device_ids=[self.local_rank])
 
     def broadcast_path(self, value: Path | None) -> Path:
         payload: list[Any] = [None if value is None else str(value)]

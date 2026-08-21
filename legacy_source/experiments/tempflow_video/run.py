@@ -146,8 +146,14 @@ def _new_run_dir(config: dict[str, Any], resume: str | None) -> Path:
             return checkpoint.parent.parent
         raise ValueError("resume checkpoint must be under <run>/checkpoints/checkpoint_N")
     stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
-    run_dir = Path(config["output_dir"]) / "runs" / stamp
-    run_dir.mkdir(parents=True, exist_ok=False)
+    runs_root = Path(config["output_dir"]) / "runs"
+    runs_root.mkdir(parents=True, exist_ok=True)
+    run_dir = runs_root / stamp
+    suffix = 1
+    while run_dir.exists():
+        run_dir = runs_root / f"{stamp}_{suffix:02d}"
+        suffix += 1
+    run_dir.mkdir(parents=False, exist_ok=False)
     return run_dir
 
 
@@ -289,6 +295,28 @@ def train(
         runtime.set_policy_version(trainer.policy_version)
 
     reward = VideoRewardAdapter(config["reward"])
+    wandb_run = None
+    if distributed.is_main and os.environ.get("WANDB_MODE", "offline") != "disabled":
+        try:
+            import wandb
+
+            wandb_run = wandb.init(
+                project=os.environ.get("WANDB_PROJECT", "tempflow-da3-mono"),
+                name=os.environ.get("WANDB_NAME", run_dir.name),
+                mode=os.environ.get("WANDB_MODE", "offline"),
+                dir=str(run_dir),
+                config={
+                    "experiment": config.get("experiment", {}),
+                    "training": config.get("training", {}),
+                    "reward": config.get("reward", {}),
+                    "reward_fusion": config.get("reward_fusion", {}),
+                    "distributed": config.get("distributed", {}),
+                },
+                resume="never",
+            )
+            print(f"W&B initialized: project={wandb_run.project}, id={wandb_run.id}", flush=True)
+        except Exception as exc:
+            raise RuntimeError(f"W&B initialization failed: {exc}") from exc
     sampler_class = TempFlowBranchSampler if branching else FlowGRPOVideoSampler
     sampler = sampler_class(
         runtime,
@@ -462,6 +490,8 @@ def train(
                     group_row["excluded_from_optimizer"] = True
                     if distributed.is_main:
                         _jsonl(run_dir / "rollout_groups.jsonl", group_row)
+                        if wandb_run is not None:
+                            wandb_run.log(_numeric_reward_leaves(group_row), step=trainer.optimizer_step)
                     rollout_group_rows.append(group_row)
                     continue
                 advantage_clip = float(
@@ -480,6 +510,8 @@ def train(
                 group_row["excluded_from_optimizer"] = False
                 if distributed.is_main:
                     _jsonl(run_dir / "rollout_groups.jsonl", group_row)
+                    if wandb_run is not None:
+                        wandb_run.log(_numeric_reward_leaves(group_row), step=trainer.optimizer_step)
                 rollout_group_rows.append(group_row)
                 rollout_buffer.append(valid_rollouts)
                 global_group_sizes.append(len(global_reward_rows))
@@ -540,6 +572,8 @@ def train(
                 if distributed.is_main:
                     _jsonl(run_dir / "optimizer_steps.jsonl", step_row)
                     print(json.dumps(step_row, ensure_ascii=False, default=str), flush=True)
+                    if wandb_run is not None:
+                        wandb_run.log(_numeric_reward_leaves(step_row), step=trainer.optimizer_step)
 
             checkpoint_due = (
                 trainer.optimizer_step // checkpoint_every
