@@ -1,0 +1,41 @@
+base_config: ${TEMPFLOW_STANDALONE_ROOT}/configs/psnr_signal_overfit_4gpu.yaml
+output_dir: ${TEMPFLOW_OUTPUT_ROOT}/psnr_sobel_scale_validation_4gpu
+max_optimizer_steps: 5
+
+experiment:
+  name: psnr_sobel_scale_validation_4gpu
+
+optimizer:
+  learning_rate: 1.0e-5
+  reference_kl_beta: 0.5
+  ppo_ratio_mode: scalar_mean
+
+reward:
+  sobel_enabled: true
+  sobel_charbonnier_epsilon: 0.001
+
+reward_fusion:
+  mode: psnr_sobel
+  lambda_psnr: 0.80
+  lambda_sobel: 0.20
+  psnr_scale_db: null
+  sobel_scale: null
+  psnr_scale_floor_db: 0.005
+  sobel_scale_floor: 0.0005
+  fused_min_group_std: 1.0e-8
+  advantage_clip: 5.0
+
+training:
+  max_optimizer_steps: 5
+  max_rollout_epochs: 5
+  optimizer_minibatches_per_rollout_epoch: 1
+  num_inner_epochs: 1
+  shuffle_rollout_buffer: false
+  checkpoint_every: 5
+
+evaluation:
+  evaluate_before_training: false
+  every_optimizer_steps: 0
+
+logging:
+  wandb_mode: offline

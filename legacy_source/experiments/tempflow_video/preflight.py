@@ -65,9 +65,10 @@ def _scheduler_report(config: dict[str, Any]) -> dict[str, Any]:
     model = config["model"]
     args = load_config(model["gesim_config"])
     root = Path(model["checkpoint_root"])
+    upstream_root = Path(model["gesim_config"]).resolve().parents[2]
     scheduler_class = import_custom_class(
         args.diffusion_scheduler_class,
-        str((Path(config["_base_config_path"]).parents[1] / args.diffusion_scheduler_class_path).resolve()),
+        str((upstream_root / args.diffusion_scheduler_class_path).resolve()),
     )
     scheduler_dir = root / Path(args.pretrained_model_name_or_path).name / "scheduler"
     scheduler = scheduler_class.from_pretrained(str(scheduler_dir))
@@ -130,18 +131,33 @@ def run_preflight(config: dict[str, Any], *, load_model: bool = False) -> dict[s
     dataset_cfg = config["dataset"]
     ids_path = Path(dataset_cfg["ids_file"])
     _require_file(ids_path, "condition id list", checks)
-    expected_ids = [
+    source_ids = [
         line.strip()
         for line in ids_path.read_text(encoding="utf-8").splitlines()
         if line.strip() and not line.lstrip().startswith("#")
     ]
-    if len(expected_ids) != 16 or len(set(expected_ids)) != 16:
-        raise ValueError(f"overfit id list must contain exactly 16 unique ids, got {len(expected_ids)}")
+    if len(source_ids) != 16 or len(set(source_ids)) != 16:
+        raise ValueError(f"overfit id list must contain exactly 16 unique ids, got {len(source_ids)}")
+    included = set(map(str, dataset_cfg.get("include_samples", ())))
+    excluded = set(map(str, dataset_cfg.get("exclude_samples", ())))
+    expected_ids = [
+        condition_id
+        for condition_id in source_ids
+        if (not included or condition_id in included) and condition_id not in excluded
+    ]
+    limit = int(dataset_cfg.get("limit", 0))
+    if limit > 0:
+        expected_ids = expected_ids[:limit]
+    expected_num_samples = int(dataset_cfg.get("expected_num_samples", 16))
+    if len(expected_ids) != expected_num_samples:
+        raise ValueError(
+            f"dataset selection expected {expected_num_samples} ids, got {len(expected_ids)}"
+        )
     manifest, invalid = build_manifest(
         dataset_cfg["prep_root"],
         include_samples=dataset_cfg.get("include_samples", ()),
         exclude_samples=dataset_cfg.get("exclude_samples", ()),
-        limit=0,
+        limit=limit,
         validation_mode=dataset_cfg.get("validation_mode", "strict"),
     )
     actual_ids = [row["condition_id"] for row in manifest["samples"]]

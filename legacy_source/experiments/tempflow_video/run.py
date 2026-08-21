@@ -15,16 +15,25 @@ import torch
 
 from experiments.awm_coca.condition_dataset import PrepConditionDataset, build_manifest, write_manifest
 from experiments.awm_coca.gesim_runtime import DEFAULT_PROMPT, PersistentGeSimRuntime
-from experiments.tempflow_video.advantage import standardize_group_rewards
+from experiments.tempflow_video.advantage import (
+    fuse_psnr_sobel_rewards,
+    standardize_group_rewards,
+)
 from experiments.tempflow_video.checkpointing import (
     load_tempflow_checkpoint,
     restore_tempflow_checkpoint,
     save_tempflow_checkpoint,
 )
 from experiments.tempflow_video.config import dump_effective_config, load_tempflow_config
+from experiments.tempflow_video.distributed import (
+    DistributedContext,
+    partition_indices,
+    weighted_mean_dict,
+)
 from experiments.tempflow_video.policy import ReferencePolicyAdapter, VideoPolicyAdapter
 from experiments.tempflow_video.preflight import run_preflight, write_preflight_report
 from experiments.tempflow_video.sampler import FlowGRPOVideoSampler, TempFlowBranchSampler
+from experiments.tempflow_video.schemas import BranchRollout
 from experiments.tempflow_video.trainer import TempFlowOptimizerConfig, TempFlowVideoTrainer
 
 
@@ -59,7 +68,144 @@ def _numeric_reward_leaves(value: Any, prefix: str = "reward") -> dict[str, floa
     return {}
 
 
-def _make_manifest(config: dict[str, Any], run_dir: Path) -> dict[str, Any]:
+def _init_wandb_run(
+    config: dict[str, Any], run_dir: Path, *, enabled: bool
+) -> Any | None:
+    if not enabled or os.environ.get("WANDB_MODE", "offline").strip().lower() == "disabled":
+        return None
+    try:
+        import wandb
+
+        mode = os.environ.get("WANDB_MODE", "offline").strip().lower()
+        run = wandb.init(
+            project=os.environ.get("WANDB_PROJECT", "awm-coca"),
+            entity=os.environ.get("WANDB_ENTITY") or None,
+            name=os.environ.get("WANDB_NAME")
+            or f"{config.get('experiment', {}).get('name', 'tempflow')}-{run_dir.name}",
+            mode=mode,
+            dir=str(run_dir),
+            config={
+                "experiment": config.get("experiment", {}),
+                "training": config.get("training", {}),
+                "optimizer": config.get("optimizer", {}),
+                "reward": config.get("reward", {}),
+                "reward_fusion": config.get("reward_fusion", {}),
+                "tempflow": config.get("tempflow", {}),
+                "distributed": config.get("distributed", {}),
+            },
+            resume="never",
+        )
+        if run is None:
+            raise RuntimeError("wandb.init returned None")
+        url = getattr(run, "url", None) or "offline"
+        status = {
+            "status": "active",
+            "mode": mode,
+            "project": getattr(run, "project", None),
+            "run_id": getattr(run, "id", None),
+            "url": url,
+        }
+        (run_dir / "wandb_run.json").write_text(
+            json.dumps(status, ensure_ascii=False, indent=2), encoding="utf-8"
+        )
+        print(f"W&B initialized: project={run.project}, id={run.id}, url={url}", flush=True)
+        return run
+    except Exception as exc:
+        raise RuntimeError(f"W&B initialization failed: {exc}") from exc
+
+
+def _wandb_log(run: Any | None, payload: dict[str, Any], *, step: int) -> None:
+    if run is None:
+        return
+    values = _numeric_reward_leaves(payload)
+    values["trainer/optimizer_step"] = float(step)
+    run.log(values, step=int(step))
+
+
+def _wandb_eval_payload(summary: dict[str, Any]) -> dict[str, float]:
+    payload = {
+        f"eval/{key}": float(summary[key])
+        for key in (
+            "reward_mean",
+            "reward_std",
+            "training_reward_mean",
+            "training_reward_std",
+        )
+        if key in summary and math.isfinite(float(summary[key]))
+    }
+    statistics = summary.get("component_statistics", {})
+    selected = {
+        "reward.geometry.metrics.balanced_psnr_db": "eval/balanced_psnr_db",
+        "reward.sobel.score": "eval/sobel_score",
+        "reward.sobel.balanced_error": "eval/sobel_error",
+    }
+    for source, target in selected.items():
+        value = statistics.get(source, {}).get("mean")
+        if value is not None and math.isfinite(float(value)):
+            payload[target] = float(value)
+    return payload
+
+
+def _training_reward_components(
+    result: dict[str, Any], config: dict[str, Any]
+) -> dict[str, float]:
+    mode = config.get("reward_fusion", {}).get("mode")
+    if mode in {"psnr_only_raw_db", "psnr_sobel"}:
+        psnr = float(result["geometry"]["metrics"]["balanced_psnr_db"])
+        if mode == "psnr_only_raw_db":
+            return {"scalar": psnr}
+        sobel = float(result["sobel"]["score"])
+        if not math.isfinite(psnr) or not math.isfinite(sobel):
+            raise FloatingPointError("PSNR/Sobel training components must be finite")
+        return {"psnr_db": psnr, "sobel_score": sobel}
+    total = float(result["total_reward"])
+    if not math.isfinite(total):
+        raise FloatingPointError("terminal training reward is non-finite")
+    return {"scalar": total}
+
+
+def _fuse_training_reward_rows(
+    rows: list[tuple[int, dict[str, float]]], config: dict[str, Any]
+) -> tuple[list[tuple[int, float]], dict[str, Any]]:
+    fusion = config.get("reward_fusion", {})
+    if fusion.get("mode") != "psnr_sobel":
+        return [(member_id, float(values["scalar"])) for member_id, values in rows], {}
+    fused, metrics = fuse_psnr_sobel_rewards(
+        [values["psnr_db"] for _, values in rows],
+        [values["sobel_score"] for _, values in rows],
+        psnr_weight=float(fusion.get("lambda_psnr", 0.8)),
+        sobel_weight=float(fusion.get("lambda_sobel", 0.2)),
+        psnr_scale=fusion.get("psnr_scale_db"),
+        sobel_scale=fusion.get("sobel_scale"),
+        psnr_scale_floor=float(fusion.get("psnr_scale_floor_db", 0.005)),
+        sobel_scale_floor=float(fusion.get("sobel_scale_floor", 0.0005)),
+    )
+    return [
+        (member_id, float(value))
+        for (member_id, _), value in zip(rows, fused.tolist(), strict=True)
+    ], {f"fusion_{key}": value for key, value in metrics.items()}
+
+
+def _group_zero_std_threshold(config: dict[str, Any]) -> float:
+    fusion = config.get("reward_fusion", {})
+    if fusion.get("mode") == "psnr_sobel":
+        return float(
+            fusion.get(
+                "fused_min_group_std",
+                config["tempflow"].get("zero_std_threshold", 1.0e-8),
+            )
+        )
+    return float(
+        fusion.get(
+            "psnr_min_group_std_db",
+            config["tempflow"].get("zero_std_threshold", 1.0e-8),
+        )
+    )
+
+
+def _make_manifest(
+    config: dict[str, Any], run_dir: Path, *, write_files: bool = True
+) -> dict[str, Any]:
     dataset = config["dataset"]
     manifest, invalid = build_manifest(
         dataset["prep_root"],
@@ -68,7 +214,8 @@ def _make_manifest(config: dict[str, Any], run_dir: Path) -> dict[str, Any]:
         limit=int(dataset.get("limit", 0)),
         validation_mode=dataset.get("validation_mode", "strict"),
     )
-    write_manifest(manifest, invalid, run_dir)
+    if write_files:
+        write_manifest(manifest, invalid, run_dir)
     return manifest
 
 
@@ -84,6 +231,8 @@ def _optimizer_config(config: dict[str, Any]) -> TempFlowOptimizerConfig:
         kl_beta=float(value.get("reference_kl_beta", 0.01)),
         warmup_steps=int(value.get("warmup_steps", 0)),
         log_term_grad_norm=bool(value.get("log_term_grad_norm", True)),
+        log_gradient_cosine=bool(value.get("log_gradient_cosine", False)),
+        ppo_ratio_mode=str(value.get("ppo_ratio_mode", "scalar_mean")),
     )
 
 
@@ -95,7 +244,15 @@ def _assert_resume_compatible(saved: dict[str, Any], current: dict[str, Any]) ->
     saved_reward.setdefault("time_alignment_protocol", "legacy_frame_index_truncate")
     saved_reward.setdefault("generated_fps", 16)
     saved_reward.setdefault("expected_gt_fps", 30)
-    for key in ("dataset", "model", "rollout", "reward", "tempflow", "optimizer"):
+    for key in (
+        "dataset",
+        "model",
+        "rollout",
+        "reward",
+        "tempflow",
+        "optimizer",
+        "distributed",
+    ):
         if saved.get(key) != current.get(key):
             raise ValueError(f"resume config mismatch in {key}; refusing mixed-policy training")
 
@@ -155,10 +312,31 @@ def evaluate_policy(
             "seed": artifact.seed,
             "policy_version": runtime.policy_version,
             "reward": result,
+            "training_reward_components": _training_reward_components(
+                result, runtime.config
+            ),
         }
-        _jsonl(target / "rewards.jsonl", row)
         rows.append(row)
+    # Evaluation seeds for one condition form the same comparison group as
+    # training branches. This also records the exact scales used for auditing.
+    for condition_id in sorted({row["condition_id"] for row in rows}):
+        indices = [
+            index for index, row in enumerate(rows) if row["condition_id"] == condition_id
+        ]
+        reward_rows, fusion_metrics = _fuse_training_reward_rows(
+            [
+                (index, rows[index]["training_reward_components"])
+                for index in indices
+            ],
+            runtime.config,
+        )
+        for index, value in reward_rows:
+            rows[index]["training_reward"] = value
+            rows[index]["reward_fusion_metrics"] = fusion_metrics
+    for row in rows:
+        _jsonl(target / "rewards.jsonl", row)
     totals = [float(row["reward"]["total_reward"]) for row in rows]
+    training_totals = [float(row["training_reward"]) for row in rows]
     leaf_rows = [_numeric_reward_leaves(row["reward"]) for row in rows]
     common_leaves = set.intersection(*(set(row) for row in leaf_rows)) if leaf_rows else set()
     component_statistics = {
@@ -170,6 +348,21 @@ def evaluate_policy(
         }
         for key in sorted(common_leaves)
     }
+    per_seed_statistics = {}
+    for seed in seeds:
+        seed_totals = [
+            float(row["training_reward"])
+            for row in rows
+            if int(row["seed"]) == int(seed)
+        ]
+        if seed_totals:
+            per_seed_statistics[str(seed)] = {
+                "mean": float(np.mean(seed_totals)),
+                "std": float(np.std(seed_totals)),
+                "min": float(np.min(seed_totals)),
+                "max": float(np.max(seed_totals)),
+                "count": len(seed_totals),
+            }
     summary = {
         "tag": tag,
         "policy_version": runtime.policy_version,
@@ -178,22 +371,43 @@ def evaluate_policy(
         "reward_std": float(np.std(totals)),
         "reward_min": float(np.min(totals)),
         "reward_max": float(np.max(totals)),
+        "training_reward_mean": float(np.mean(training_totals)),
+        "training_reward_std": float(np.std(training_totals)),
+        "training_reward_min": float(np.min(training_totals)),
+        "training_reward_max": float(np.max(training_totals)),
         "component_statistics": component_statistics,
+        "per_seed_statistics": per_seed_statistics,
     }
     (target / "summary.json").write_text(json.dumps(summary, indent=2), encoding="utf-8")
     return summary
 
 
-def train(config: dict[str, Any], run_dir: Path, *, resume: str | None, max_steps: int | None) -> None:
+def train(
+    config: dict[str, Any],
+    run_dir: Path,
+    *,
+    resume: str | None,
+    max_steps: int | None,
+    distributed: DistributedContext,
+) -> None:
     from experiments.tempflow_video.reward_adapter import VideoRewardAdapter
 
     branching = bool(config["tempflow"]["trajectory_branching"])
-    manifest = _make_manifest(config, run_dir)
+    if distributed.enabled and not branching:
+        raise NotImplementedError(
+            "distributed runner currently supports TempFlow branching only, not ordinary video GRPO"
+        )
+    manifest = _make_manifest(config, run_dir, write_files=distributed.is_main)
     dataset = PrepConditionDataset(manifest)
-    runtime = PersistentGeSimRuntime(config, device="cuda")
+    runtime = PersistentGeSimRuntime(config, device=distributed.device)
     policy = VideoPolicyAdapter(runtime)
     reference = ReferencePolicyAdapter(policy)
-    trainer = TempFlowVideoTrainer(policy, reference, _optimizer_config(config))
+    trainer = TempFlowVideoTrainer(
+        policy,
+        reference,
+        _optimizer_config(config),
+        gradient_reducer=distributed.sum_tensors_ if distributed.enabled else None,
+    )
     if resume:
         payload = load_tempflow_checkpoint(resume, map_location="cpu")
         _assert_resume_compatible(payload["config"], config)
@@ -212,6 +426,7 @@ def train(config: dict[str, Any], run_dir: Path, *, resume: str | None, max_step
         runtime.set_policy_version(trainer.policy_version)
 
     reward = VideoRewardAdapter(config["reward"])
+    wandb_run = _init_wandb_run(config, run_dir, enabled=distributed.is_main)
     sampler_class = TempFlowBranchSampler if branching else FlowGRPOVideoSampler
     sampler = sampler_class(
         runtime,
@@ -224,6 +439,44 @@ def train(config: dict[str, Any], run_dir: Path, *, resume: str | None, max_step
     initial_seed = int(config["tempflow"]["initial_seed"])
     noise_seed_base = int(config["tempflow"]["branch_noise_seed_base"])
     checkpoint_every = int(config["training"].get("checkpoint_every", 1))
+    if branches < distributed.world_size:
+        raise ValueError(
+            f"tempflow.branch_factor={branches} must be >= world_size={distributed.world_size}"
+        )
+    local_branch_ids = partition_indices(branches, distributed.world_size, distributed.rank)
+    rank_output = (
+        run_dir / "distributed" / f"rank_{distributed.rank:02d}"
+        if distributed.enabled
+        else run_dir
+    )
+    evaluation_config = config.get("evaluation", {})
+    if (
+        trainer.optimizer_step == 0
+        and bool(evaluation_config.get("evaluate_before_training", False))
+        and not bool(config.get("sampling", {}).get("smoke_only", False))
+    ):
+        if distributed.is_main:
+            baseline = evaluate_policy(
+                runtime,
+                dataset,
+                reward,
+                run_dir=run_dir,
+                seeds=[
+                    int(seed)
+                    for seed in evaluation_config.get(
+                        "fixed_generation_seeds", [12345678]
+                    )
+                ],
+                max_conditions=int(evaluation_config.get("fixed_samples", 16)),
+                tag="policy_00000000_baseline",
+            )
+            _jsonl(run_dir / "evaluation_history.jsonl", baseline)
+            _wandb_log(
+                wandb_run,
+                _wandb_eval_payload(baseline),
+                step=trainer.optimizer_step,
+            )
+        distributed.barrier()
 
     if branching:
         configured_timesteps = config["tempflow"].get("branch_timesteps")
@@ -250,7 +503,7 @@ def train(config: dict[str, Any], run_dir: Path, *, resume: str | None, max_step
             torch.cuda.reset_peak_memory_stats()
             started = time.monotonic()
             common_sampling = {
-                "output_dir": run_dir,
+                "output_dir": rank_output,
                 "prompt": DEFAULT_PROMPT,
                 "prompt_id": "default",
                 "reward_config_sha256": reward.config_sha256,
@@ -261,86 +514,112 @@ def train(config: dict[str, Any], run_dir: Path, *, resume: str | None, max_step
             base_artifact = sampler.sample_base(
                 prepared,
                 initial_seed=initial_seed,
-                output_dir=run_dir,
+                output_dir=rank_output,
                 prompt=DEFAULT_PROMPT,
             )
             rollout_buffer = []
+            global_group_sizes = []
             rollout_group_rows = []
             for timestep_position, branch_timestep in enumerate(timesteps):
-                seeds = [
+                global_seeds = [
                     noise_seed_base
                     + collection_epoch * len(timesteps) * branches
                     + timestep_position * branches
                     + offset
                     for offset in range(branches)
                 ]
+                seeds = [global_seeds[index] for index in local_branch_ids]
                 _, rollouts = sampler.sample_group(
                     prepared,
                     initial_seed=initial_seed,
                     branch_timestep=branch_timestep,
                     branch_noise_seeds=seeds,
+                    branch_ids=local_branch_ids,
                     base_artifact=base_artifact,
                     **common_sampling,
                 )
-                rewards = []
+                prefix_hashes = distributed.gather_objects(
+                    rollouts[0].prefix_latent_sha256
+                )
+                if len(set(prefix_hashes)) != 1:
+                    raise RuntimeError(
+                        "deterministic TempFlow prefix differs across ranks; refusing a mixed group"
+                    )
+                reward_components = []
                 valid_rollouts = []
                 for rollout in rollouts:
                     try:
                         result = reward.score_rollout(rollout, prep_dir=raw.sample_dir)
-                        if config.get("reward_fusion", {}).get("mode") == "psnr_only_raw_db":
-                            training_reward = float(
-                                result["geometry"]["metrics"]["balanced_psnr_db"]
-                            )
-                        else:
-                            training_reward = float(result["total_reward"])
-                        if not math.isfinite(training_reward):
-                            raise FloatingPointError("terminal training reward is non-finite")
-                        rollout.reward["training_reward"] = training_reward
-                        rewards.append(training_reward)
+                        components = _training_reward_components(result, config)
+                        rollout.reward["training_reward_components"] = components
+                        reward_components.append(components)
                         valid_rollouts.append(rollout)
                     except Exception as exc:
                         _jsonl(
-                            run_dir / "invalid_rollouts.jsonl",
+                            rank_output / "invalid_rollouts.jsonl",
                             {"sample_id": rollout.sample_id, "error": repr(exc)},
                         )
                 minimum = int(config["reward"].get("min_valid_seeds_per_group", 2))
                 trainer.group_attempts += 1
-                if len(valid_rollouts) < minimum:
+                local_reward_rows = [
+                    (int(rollout.branch_id), values)
+                    for rollout, values in zip(valid_rollouts, reward_components)
+                ]
+                gathered_reward_rows = distributed.gather_objects(local_reward_rows)
+                if any(len(rows) == 0 for rows in gathered_reward_rows):
                     raise RuntimeError(
-                        f"valid reward branches {len(valid_rollouts)} < required {minimum}; "
+                        "at least one rank has no valid PSNR branch; refusing desynchronized update"
+                    )
+                global_component_rows = sorted(
+                    (row for rows in gathered_reward_rows for row in rows),
+                    key=lambda row: row[0],
+                )
+                global_reward_rows, fusion_metrics = _fuse_training_reward_rows(
+                    global_component_rows, config
+                )
+                global_ids = [row[0] for row in global_reward_rows]
+                if len(global_ids) != len(set(global_ids)):
+                    raise RuntimeError("distributed branch shards contain duplicate global branch IDs")
+                if len(global_reward_rows) < minimum:
+                    raise RuntimeError(
+                        f"valid reward branches {len(global_reward_rows)} < required {minimum}; "
                         "refusing an invalid group"
                     )
                 advantages = standardize_group_rewards(
-                    rewards,
+                    [row[1] for row in global_reward_rows],
                     epsilon=float(config["tempflow"].get("advantage_epsilon", 1.0e-6)),
-                    zero_std_threshold=float(
-                        config.get("reward_fusion", {}).get(
-                            "psnr_min_group_std_db",
-                            config["tempflow"].get("zero_std_threshold", 1.0e-8),
-                        )
-                    ),
+                    zero_std_threshold=_group_zero_std_threshold(config),
                 )
                 group_row = {
                     "rollout_epoch": collection_epoch,
                     "group_attempt": trainer.group_attempts,
                     "condition_id": raw.condition_id,
                     "branch_timestep": branch_timestep,
-                    "flow_time": float(valid_rollouts[0].flow_time),
-                    "next_flow_time": float(valid_rollouts[0].next_flow_time),
+                    "flow_time": float(rollouts[0].flow_time),
+                    "next_flow_time": float(rollouts[0].next_flow_time),
                     "collection_policy_version": collection_policy_version,
+                    "world_size": distributed.world_size,
+                    "branches_per_rank": [len(rows) for rows in gathered_reward_rows],
+                    **fusion_metrics,
                     **advantages.metrics(),
                 }
                 if advantages.zero_std:
                     group_row["excluded_from_optimizer"] = True
-                    _jsonl(run_dir / "rollout_groups.jsonl", group_row)
+                    if distributed.is_main:
+                        _jsonl(run_dir / "rollout_groups.jsonl", group_row)
+                        _wandb_log(wandb_run, group_row, step=trainer.optimizer_step)
                     rollout_group_rows.append(group_row)
                     continue
                 advantage_clip = float(
                     config.get("reward_fusion", {}).get("advantage_clip", float("inf"))
                 )
-                for rollout, advantage in zip(
-                    valid_rollouts, advantages.advantages.tolist()
-                ):
+                advantage_by_id = dict(zip(global_ids, advantages.advantages.tolist()))
+                training_reward_by_id = dict(global_reward_rows)
+                for rollout in valid_rollouts:
+                    rollout.reward["training_reward"] = training_reward_by_id[
+                        int(rollout.branch_id)
+                    ]
+                    advantage = advantage_by_id[int(rollout.branch_id)]
                     rollout.advantage = float(
                         max(-advantage_clip, min(advantage_clip, advantage))
                     )
@@ -349,9 +628,12 @@ def train(config: dict[str, Any], run_dir: Path, *, resume: str | None, max_step
                         encoding="utf-8",
                     )
                 group_row["excluded_from_optimizer"] = False
-                _jsonl(run_dir / "rollout_groups.jsonl", group_row)
+                if distributed.is_main:
+                    _jsonl(run_dir / "rollout_groups.jsonl", group_row)
+                    _wandb_log(wandb_run, group_row, step=trainer.optimizer_step)
                 rollout_group_rows.append(group_row)
                 rollout_buffer.append(valid_rollouts)
+                global_group_sizes.append(len(global_reward_rows))
 
             if not rollout_buffer:
                 trainer.rollout_epoch += 1
@@ -365,10 +647,34 @@ def train(config: dict[str, Any], run_dir: Path, *, resume: str | None, max_step
                 shuffle=shuffle_buffer,
                 seed=int(config.get("seed", 0)) + collection_epoch,
                 max_updates=remaining_updates,
+                global_group_sizes=global_group_sizes,
             )
             trainer.rollout_epoch += 1
             runtime.set_policy_version(trainer.policy_version)
             for minibatch_index, record in enumerate(records):
+                gathered_records = distributed.gather_objects(
+                    {
+                        "metrics": record.metrics,
+                        "local_count": sum(len(group) for group in rollout_buffer),
+                    }
+                )
+                combined_metrics = weighted_mean_dict(
+                    [item["metrics"] for item in gathered_records],
+                    [int(item["local_count"]) for item in gathered_records],
+                    shared_keys={
+                        "policy_grad_norm",
+                        "raw_kl_grad_norm",
+                        "weighted_kl_grad_norm",
+                        "total_grad_norm_before_clip",
+                        "total_grad_norm_after_clip",
+                        "learning_rate",
+                        "changed_trainable_parameter_tensors",
+                        "parameter_delta_norm",
+                        "gradient_cosine_with_previous_step",
+                        "gradient_cosine_has_previous_step",
+                        "gradient_cosine_is_defined",
+                    },
+                )
                 step_row = {
                     "rollout_epoch": collection_epoch,
                     "minibatch_index": minibatch_index,
@@ -380,24 +686,29 @@ def train(config: dict[str, Any], run_dir: Path, *, resume: str | None, max_step
                     "peak_cuda_allocated_bytes": torch.cuda.max_memory_allocated(),
                     "peak_cuda_reserved_bytes": torch.cuda.max_memory_reserved(),
                     **record.to_dict(),
+                    "metrics": combined_metrics,
                 }
-                _jsonl(run_dir / "optimizer_steps.jsonl", step_row)
-                print(json.dumps(step_row, ensure_ascii=False, default=str), flush=True)
+                if distributed.is_main:
+                    _jsonl(run_dir / "optimizer_steps.jsonl", step_row)
+                    print(json.dumps(step_row, ensure_ascii=False, default=str), flush=True)
+                    _wandb_log(wandb_run, step_row, step=record.optimizer_step)
 
             checkpoint_due = (
                 trainer.optimizer_step // checkpoint_every
                 > optimizer_step_before_buffer // checkpoint_every
             )
             if checkpoint_due or trainer.optimizer_step == target_steps:
-                save_tempflow_checkpoint(
-                    run_dir / "checkpoints",
-                    step=trainer.optimizer_step,
-                    policy=runtime.transformer,
-                    optimizer=trainer.optimizer,
-                    lr_scheduler=trainer.lr_scheduler,
-                    trainer_state=trainer.state_dict(),
-                    config=config,
-                )
+                if distributed.is_main:
+                    save_tempflow_checkpoint(
+                        run_dir / "checkpoints",
+                        step=trainer.optimizer_step,
+                        policy=runtime.transformer,
+                        optimizer=trainer.optimizer,
+                        lr_scheduler=trainer.lr_scheduler,
+                        trainer_state=trainer.state_dict(),
+                        config=config,
+                    )
+                distributed.barrier()
             eval_every = int(config.get("evaluation", {}).get("every_optimizer_steps", 0) or 0)
             if (
                 not bool(config.get("sampling", {}).get("smoke_only", False))
@@ -405,26 +716,35 @@ def train(config: dict[str, Any], run_dir: Path, *, resume: str | None, max_step
                 and trainer.optimizer_step // eval_every
                 > optimizer_step_before_buffer // eval_every
             ):
-                summary = evaluate_policy(
-                    runtime,
-                    dataset,
-                    reward,
-                    run_dir=run_dir,
-                    seeds=[
-                        int(seed)
-                        for seed in config["evaluation"].get(
-                            "fixed_generation_seeds", [12345678]
-                        )
-                    ],
-                    max_conditions=int(config["evaluation"].get("fixed_samples", 16)),
-                    tag=f"policy_{runtime.policy_version:08d}",
-                )
-                _jsonl(run_dir / "evaluation_history.jsonl", summary)
+                if distributed.is_main:
+                    summary = evaluate_policy(
+                        runtime,
+                        dataset,
+                        reward,
+                        run_dir=run_dir,
+                        seeds=[
+                            int(seed)
+                            for seed in config["evaluation"].get(
+                                "fixed_generation_seeds", [12345678]
+                            )
+                        ],
+                        max_conditions=int(config["evaluation"].get("fixed_samples", 16)),
+                        tag=f"policy_{runtime.policy_version:08d}",
+                    )
+                    _jsonl(run_dir / "evaluation_history.jsonl", summary)
+                    _wandb_log(
+                        wandb_run,
+                        _wandb_eval_payload(summary),
+                        step=trainer.optimizer_step,
+                    )
+                distributed.barrier()
         if trainer.optimizer_step < target_steps:
             raise RuntimeError(
                 f"only completed {trainer.optimizer_step}/{target_steps} optimizer steps after "
                 f"{trainer.rollout_epoch} rollout epochs"
             )
+        if wandb_run is not None:
+            wandb_run.finish()
         return
 
     timesteps = [int(value) for value in config["tempflow"].get("branch_timesteps", ())]
@@ -446,14 +766,21 @@ def train(config: dict[str, Any], run_dir: Path, *, resume: str | None, max_step
             "video_length": int(config["rollout"]["total_frames"]),
         }
         if branching:
-            seeds = [noise_seed_base + attempts * branches + offset for offset in range(branches)]
+            global_seeds = [noise_seed_base + attempts * branches + offset for offset in range(branches)]
+            seeds = [global_seeds[index] for index in local_branch_ids]
             group_dir, rollouts = sampler.sample_group(
                 prepared,
                 initial_seed=initial_seed,
                 branch_timestep=branch_timestep,
                 branch_noise_seeds=seeds,
-                **common_sampling,
+                branch_ids=local_branch_ids,
+                **{**common_sampling, "output_dir": rank_output},
             )
+            prefix_hashes = distributed.gather_objects(rollouts[0].prefix_latent_sha256)
+            if len(set(prefix_hashes)) != 1:
+                raise RuntimeError(
+                    "deterministic TempFlow prefix differs across ranks; refusing a mixed group"
+                )
         else:
             initial_seeds = [initial_seed + attempts * branches + offset for offset in range(branches)]
             group_dir, rollouts = sampler.sample_group(
@@ -461,37 +788,56 @@ def train(config: dict[str, Any], run_dir: Path, *, resume: str | None, max_step
                 initial_seeds=initial_seeds,
                 transition_noise_seed_base=noise_seed_base + attempts * 1_000_000,
                 group_sequence=attempts,
-                **common_sampling,
+                **{**common_sampling, "output_dir": rank_output},
             )
-        rewards = []
+        reward_components = []
         valid_rollouts = []
         for rollout in rollouts:
             try:
                 result = reward.score_rollout(rollout, prep_dir=raw.sample_dir)
-                if config.get("reward_fusion", {}).get("mode") == "psnr_only_raw_db":
-                    training_reward = float(result["geometry"]["metrics"]["balanced_psnr_db"])
-                else:
-                    training_reward = float(result["total_reward"])
-                if not math.isfinite(training_reward):
-                    raise FloatingPointError("terminal training reward is non-finite")
-                rollout.reward["training_reward"] = training_reward
-                rewards.append(training_reward)
+                components = _training_reward_components(result, config)
+                rollout.reward["training_reward_components"] = components
+                reward_components.append(components)
                 valid_rollouts.append(rollout)
             except Exception as exc:
-                _jsonl(run_dir / "invalid_rollouts.jsonl", {"sample_id": rollout.sample_id, "error": repr(exc)})
+                _jsonl(
+                    rank_output / "invalid_rollouts.jsonl",
+                    {"sample_id": rollout.sample_id, "error": repr(exc)},
+                )
         minimum = int(config["reward"].get("min_valid_seeds_per_group", 2))
         attempts += 1
         trainer.group_attempts = attempts
-        if len(valid_rollouts) < minimum:
+        local_reward_rows = [
+            (
+                int(
+                    rollout.branch_id
+                    if isinstance(rollout, BranchRollout)
+                    else rollout.rollout_id
+                ),
+                values,
+            )
+            for rollout, values in zip(valid_rollouts, reward_components)
+        ]
+        gathered_reward_rows = distributed.gather_objects(local_reward_rows)
+        if any(len(rows) == 0 for rows in gathered_reward_rows):
+            raise RuntimeError("at least one rank has no valid PSNR branch; refusing desynchronized update")
+        global_component_rows = sorted(
+            (row for rows in gathered_reward_rows for row in rows), key=lambda row: row[0]
+        )
+        global_reward_rows, fusion_metrics = _fuse_training_reward_rows(
+            global_component_rows, config
+        )
+        global_ids = [row[0] for row in global_reward_rows]
+        if len(global_ids) != len(set(global_ids)):
+            raise RuntimeError("distributed branch shards contain duplicate global branch IDs")
+        if len(global_reward_rows) < minimum:
             raise RuntimeError(
-                f"valid reward branches {len(valid_rollouts)} < required {minimum}; refusing an invalid group"
+                f"valid reward branches {len(global_reward_rows)} < required {minimum}; refusing an invalid group"
             )
         advantages = standardize_group_rewards(
-            rewards,
+            [row[1] for row in global_reward_rows],
             epsilon=float(config["tempflow"].get("advantage_epsilon", 1.0e-6)),
-            zero_std_threshold=float(config.get("reward_fusion", {}).get(
-                "psnr_min_group_std_db", config["tempflow"].get("zero_std_threshold", 1.0e-8)
-            )),
+            zero_std_threshold=_group_zero_std_threshold(config),
         )
         group_row = {
             "attempt": attempts,
@@ -499,58 +845,101 @@ def train(config: dict[str, Any], run_dir: Path, *, resume: str | None, max_step
             "branch_timestep": branch_timestep,
             "policy_version": runtime.policy_version,
             "elapsed_seconds_before_update": time.monotonic() - started,
+            **fusion_metrics,
             **advantages.metrics(),
         }
         if advantages.zero_std:
             group_row["optimizer_update_skipped"] = True
-            _jsonl(run_dir / "groups.jsonl", group_row)
+            if distributed.is_main:
+                _jsonl(run_dir / "groups.jsonl", group_row)
             continue
         advantage_clip = float(config.get("reward_fusion", {}).get("advantage_clip", float("inf")))
-        for rollout, advantage in zip(valid_rollouts, advantages.advantages.tolist()):
+        advantage_by_id = dict(zip(global_ids, advantages.advantages.tolist()))
+        training_reward_by_id = dict(global_reward_rows)
+        for rollout in valid_rollouts:
+            member_id = (
+                rollout.branch_id
+                if isinstance(rollout, BranchRollout)
+                else rollout.rollout_id
+            )
+            rollout.reward["training_reward"] = training_reward_by_id[int(member_id)]
+            advantage = advantage_by_id[int(member_id)]
             rollout.advantage = float(max(-advantage_clip, min(advantage_clip, advantage)))
             (rollout.seed_dir / "rollout.json").write_text(
                 json.dumps(rollout.metadata(), ensure_ascii=False, indent=2), encoding="utf-8"
             )
-        record = trainer.update_group(valid_rollouts)
+        record = trainer.update_group(
+            valid_rollouts, global_group_size=len(global_reward_rows)
+        )
         runtime.set_policy_version(record.policy_version)
-        group_row.update(record.to_dict())
+        gathered_records = distributed.gather_objects(
+            {"metrics": record.metrics, "local_count": len(valid_rollouts)}
+        )
+        combined_metrics = weighted_mean_dict(
+            [item["metrics"] for item in gathered_records],
+            [int(item["local_count"]) for item in gathered_records],
+            shared_keys={
+                "policy_grad_norm",
+                "raw_kl_grad_norm",
+                "weighted_kl_grad_norm",
+                "total_grad_norm_before_clip",
+                "total_grad_norm_after_clip",
+                "learning_rate",
+                "changed_trainable_parameter_tensors",
+            },
+        )
+        group_row.update(
+            {
+                "optimizer_step": record.optimizer_step,
+                "policy_version": record.policy_version,
+                "metrics": combined_metrics,
+                "world_size": distributed.world_size,
+                "branches_per_rank": [len(rows) for rows in gathered_reward_rows],
+            }
+        )
         group_row["optimizer_update_skipped"] = False
         group_row["elapsed_seconds_total"] = time.monotonic() - started
         group_row["peak_cuda_allocated_bytes"] = torch.cuda.max_memory_allocated()
         group_row["peak_cuda_reserved_bytes"] = torch.cuda.max_memory_reserved()
-        _jsonl(run_dir / "groups.jsonl", group_row)
+        if distributed.is_main:
+            _jsonl(run_dir / "groups.jsonl", group_row)
         if trainer.optimizer_step % checkpoint_every == 0 or trainer.optimizer_step == target_steps:
-            save_tempflow_checkpoint(
-                run_dir / "checkpoints",
-                step=trainer.optimizer_step,
-                policy=runtime.transformer,
-                optimizer=trainer.optimizer,
-                lr_scheduler=trainer.lr_scheduler,
-                trainer_state=trainer.state_dict(),
-                config=config,
-            )
+            if distributed.is_main:
+                save_tempflow_checkpoint(
+                    run_dir / "checkpoints",
+                    step=trainer.optimizer_step,
+                    policy=runtime.transformer,
+                    optimizer=trainer.optimizer,
+                    lr_scheduler=trainer.lr_scheduler,
+                    trainer_state=trainer.state_dict(),
+                    config=config,
+                )
+            distributed.barrier()
         eval_every = int(config.get("evaluation", {}).get("every_optimizer_steps", 0) or 0)
         if (
             not bool(config.get("sampling", {}).get("smoke_only", False))
             and eval_every > 0
             and trainer.optimizer_step % eval_every == 0
         ):
-            summary = evaluate_policy(
-                runtime,
-                dataset,
-                reward,
-                run_dir=run_dir,
-                seeds=[
-                    int(seed)
-                    for seed in config["evaluation"].get(
-                        "fixed_generation_seeds", [12345678]
-                    )
-                ],
-                max_conditions=int(config["evaluation"].get("fixed_samples", 16)),
-                tag=f"policy_{runtime.policy_version:08d}",
-            )
-            _jsonl(run_dir / "evaluation_history.jsonl", summary)
-        print(json.dumps(group_row, ensure_ascii=False, default=str), flush=True)
+            if distributed.is_main:
+                summary = evaluate_policy(
+                    runtime,
+                    dataset,
+                    reward,
+                    run_dir=run_dir,
+                    seeds=[
+                        int(seed)
+                        for seed in config["evaluation"].get(
+                            "fixed_generation_seeds", [12345678]
+                        )
+                    ],
+                    max_conditions=int(config["evaluation"].get("fixed_samples", 16)),
+                    tag=f"policy_{runtime.policy_version:08d}",
+                )
+                _jsonl(run_dir / "evaluation_history.jsonl", summary)
+            distributed.barrier()
+        if distributed.is_main:
+            print(json.dumps(group_row, ensure_ascii=False, default=str), flush=True)
     if trainer.optimizer_step < target_steps:
         raise RuntimeError(
             f"only completed {trainer.optimizer_step}/{target_steps} optimizer steps after {attempts} groups; "
@@ -568,35 +957,73 @@ def main() -> None:
     parser.add_argument("--skip-preflight", action="store_true")
     args = parser.parse_args()
     config = load_tempflow_config(args.config)
-    os.environ["AWM_ASSET_ROOT"] = str(Path(config["model"]["checkpoint_root"]).parent)
-    _seed_everything(int(config.get("seed", 42)))
-    if not args.skip_preflight:
-        report = run_preflight(config, load_model=args.load_model_preflight)
-        report_path = Path(config["output_dir"]) / "preflight.json"
-        write_preflight_report(report, report_path)
-    if args.preflight_only:
-        return
-    run_dir = _new_run_dir(config, args.resume)
-    dump_effective_config(config, run_dir / "effective_config.yaml")
-    if config["experiment"]["mode"] == "base_eval":
-        from experiments.tempflow_video.reward_adapter import VideoRewardAdapter
+    # Source dependencies (SAM3/CoWTracker) and model weights may live in
+    # separate checkouts on the training host.  Preserve an explicitly
+    # configured source root and derive it from the model path only as the
+    # standalone fallback.
+    os.environ.setdefault(
+        "AWM_ASSET_ROOT", str(Path(config["model"]["checkpoint_root"]).parent)
+    )
+    # Action reward assets (SAM3/CoWTracker/YOLO) live beside the GE-Sim
+    # checkpoint, while their source code may come from a separate checkout.
+    os.environ["AWM_MODEL_ROOT"] = str(Path(config["model"]["checkpoint_root"]))
+    if str(config.get("reward", {}).get("mode", "")).lower() in {"action", "joint"}:
+        # SAM3 inspects distributed state while it is constructed.  Build one
+        # rank-local instance before the trainer process group exists; otherwise
+        # rank-0-only fixed evaluation can advance the default NCCL collective
+        # sequence and desynchronize the next training all-gather.
+        local_rank = int(os.environ.get("LOCAL_RANK", "0"))
+        if torch.cuda.is_available():
+            torch.cuda.set_device(local_rank)
+        from experiments.action_following.sam_tracking import get_sam3_video_model
 
-        manifest = _make_manifest(config, run_dir)
-        dataset = PrepConditionDataset(manifest)
-        runtime = PersistentGeSimRuntime(config, device="cuda")
-        reward = VideoRewardAdapter(config["reward"])
-        summary = evaluate_policy(
-            runtime,
-            dataset,
-            reward,
-            run_dir=run_dir,
-            seeds=[int(seed) for seed in config["evaluation"]["fixed_generation_seeds"]],
-            max_conditions=int(config["evaluation"].get("fixed_samples", 16)),
-            tag="base_policy",
-        )
-        print(json.dumps(summary, ensure_ascii=False), flush=True)
-    else:
-        train(config, run_dir, resume=args.resume, max_steps=args.max_optimizer_steps)
+        get_sam3_video_model()
+    distributed = DistributedContext.initialize(
+        int(config.get("distributed", {}).get("world_size", 1))
+    )
+    try:
+        _seed_everything(int(config.get("seed", 42)))
+        if not args.skip_preflight and distributed.is_main:
+            report = run_preflight(config, load_model=args.load_model_preflight)
+            report_path = Path(config["output_dir"]) / "preflight.json"
+            write_preflight_report(report, report_path)
+        distributed.barrier()
+        if args.preflight_only:
+            return
+        local_run_dir = _new_run_dir(config, args.resume) if distributed.is_main else None
+        run_dir = distributed.broadcast_path(local_run_dir)
+        if distributed.is_main:
+            dump_effective_config(config, run_dir / "effective_config.yaml")
+        distributed.barrier()
+        if config["experiment"]["mode"] == "base_eval":
+            if distributed.is_main:
+                from experiments.tempflow_video.reward_adapter import VideoRewardAdapter
+
+                manifest = _make_manifest(config, run_dir)
+                dataset = PrepConditionDataset(manifest)
+                runtime = PersistentGeSimRuntime(config, device=distributed.device)
+                reward = VideoRewardAdapter(config["reward"])
+                summary = evaluate_policy(
+                    runtime,
+                    dataset,
+                    reward,
+                    run_dir=run_dir,
+                    seeds=[int(seed) for seed in config["evaluation"]["fixed_generation_seeds"]],
+                    max_conditions=int(config["evaluation"].get("fixed_samples", 16)),
+                    tag="base_policy",
+                )
+                print(json.dumps(summary, ensure_ascii=False), flush=True)
+            distributed.barrier()
+        else:
+            train(
+                config,
+                run_dir,
+                resume=args.resume,
+                max_steps=args.max_optimizer_steps,
+                distributed=distributed,
+            )
+    finally:
+        distributed.close()
 
 
 if __name__ == "__main__":

@@ -18,6 +18,7 @@ def test_frozen_old_policy_buffer_makes_later_ratio_nontrivial(tmp_path):
             clip_range=1.0e-4,
             kl_beta=0.0,
             log_term_grad_norm=False,
+            log_gradient_cosine=True,
         ),
     )
     first = make_toy_rollouts(policy, tmp_path / "first")
@@ -39,6 +40,64 @@ def test_frozen_old_policy_buffer_makes_later_ratio_nontrivial(tmp_path):
     assert records[0].metrics["clip_fraction"] == pytest.approx(0.0)
     assert records[1].metrics["ratio_mean"] != pytest.approx(1.0)
     assert records[1].metrics["clip_fraction"] > 0.0
+    assert records[0].metrics["gradient_cosine_has_previous_step"] == 0.0
+    assert records[1].metrics["gradient_cosine_has_previous_step"] == 1.0
+    assert -1.0 <= records[1].metrics["gradient_cosine_with_previous_step"] <= 1.0
 
     with pytest.raises(ValueError, match="already consumed"):
         trainer.update_rollout_buffer([first])
+
+
+def test_one_timestep_group_reused_for_two_inner_epochs_activates_ratio(tmp_path):
+    policy = ToyVideoPolicy()
+    trainer = TempFlowVideoTrainer(
+        policy,
+        ReferencePolicyAdapter(policy),
+        TempFlowOptimizerConfig(
+            learning_rate=0.05,
+            clip_range=1.0e-4,
+            kl_beta=0.0,
+            log_term_grad_norm=False,
+        ),
+    )
+    group = make_toy_rollouts(policy, tmp_path / "single")
+
+    records = trainer.update_rollout_buffer(
+        [group],
+        minibatches_per_epoch=1,
+        num_inner_epochs=2,
+        shuffle=False,
+    )
+
+    assert len(records) == 2
+    assert records[0].metrics["ratio_mean"] == pytest.approx(1.0)
+    assert records[1].metrics["ratio_mean"] != pytest.approx(1.0)
+    assert records[1].metrics["clip_fraction"] > 0.0
+
+
+def test_token_ratio_mode_clips_reused_latent_tokens(tmp_path):
+    policy = ToyVideoPolicy()
+    trainer = TempFlowVideoTrainer(
+        policy,
+        ReferencePolicyAdapter(policy),
+        TempFlowOptimizerConfig(
+            learning_rate=0.05,
+            clip_range=1.0e-4,
+            kl_beta=0.0,
+            log_term_grad_norm=False,
+            ppo_ratio_mode="latent_token_channel_mean",
+        ),
+    )
+    records = trainer.update_rollout_buffer(
+        [make_toy_rollouts(policy, tmp_path / "token")],
+        minibatches_per_epoch=1,
+        num_inner_epochs=2,
+        shuffle=False,
+    )
+
+    assert records[0].metrics["clip_fraction"] == pytest.approx(0.0)
+    assert records[1].metrics["clip_fraction"] > 0.0
+    assert records[1].metrics["ratio_min"] < records[1].metrics["ratio_max"] or records[1].metrics[
+        "ratio_mean"
+    ] != pytest.approx(1.0)
+    assert records[1].metrics["ratio_abs_deviation_p95"] > 1.0e-4

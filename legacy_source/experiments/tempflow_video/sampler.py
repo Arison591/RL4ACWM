@@ -17,6 +17,7 @@ from experiments.tempflow_video.schemas import (
     OrdinaryGroupKey,
     OrdinaryRollout,
 )
+from tempflow_video.runtime.rng_isolation import isolated_rng
 from utils import save_video
 
 
@@ -33,6 +34,12 @@ def _file_sha256(path: Path) -> str:
     return digest.hexdigest()
 
 
+def _rng_devices(device: torch.device) -> list[int]:
+    if device.type != "cuda":
+        return []
+    return [torch.cuda.current_device() if device.index is None else int(device.index)]
+
+
 class VideoTrajectorySampler:
     """Capture GE-Sim's deterministic base trajectory for a fixed initial seed."""
 
@@ -47,14 +54,17 @@ class VideoTrajectorySampler:
         output_dir: str | Path,
         prompt: str,
     ):
-        _, artifacts = self.runtime.rollout_group(
-            prepared,
-            seeds=[int(initial_seed)],
-            output_dir=output_dir,
-            prompt=prompt,
-            expected_group_size=1,
-            rollout_batch_size=1,
-        )
+        with isolated_rng(
+            int(initial_seed), devices=_rng_devices(self.runtime.device)
+        ):
+            _, artifacts = self.runtime.rollout_group(
+                prepared,
+                seeds=[int(initial_seed)],
+                output_dir=output_dir,
+                prompt=prompt,
+                expected_group_size=1,
+                rollout_batch_size=1,
+            )
         if len(artifacts) != 1:
             raise RuntimeError("deterministic base rollout must produce exactly one artifact")
         return artifacts[0]
@@ -145,6 +155,7 @@ class TempFlowBranchSampler:
         initial_seed: int,
         branch_timestep: int,
         branch_noise_seeds: Sequence[int],
+        branch_ids: Sequence[int] | None = None,
         output_dir: str | Path,
         prompt: str,
         prompt_id: str,
@@ -152,8 +163,12 @@ class TempFlowBranchSampler:
         video_length: int = 29,
         base_artifact=None,
     ) -> tuple[Path, list[BranchRollout]]:
-        if len(branch_noise_seeds) < 2 or len(set(map(int, branch_noise_seeds))) != len(branch_noise_seeds):
-            raise ValueError("branch group requires at least two unique branch noise seeds")
+        if not branch_noise_seeds or len(set(map(int, branch_noise_seeds))) != len(branch_noise_seeds):
+            raise ValueError("local branch shard requires unique branch noise seeds")
+        if branch_ids is None:
+            branch_ids = list(range(len(branch_noise_seeds)))
+        if len(branch_ids) != len(branch_noise_seeds) or len(set(map(int, branch_ids))) != len(branch_ids):
+            raise ValueError("branch_ids must be unique and match branch_noise_seeds")
         base = base_artifact
         if base is None:
             base = self.sample_base(
@@ -204,32 +219,36 @@ class TempFlowBranchSampler:
         self.runtime.transformer.eval()
         rollouts: list[BranchRollout] = []
         try:
-            for branch_id, noise_seed in enumerate(branch_noise_seeds):
-                generator = torch.Generator(device=self.runtime.device).manual_seed(int(noise_seed))
-                transition = self.policy.sample_one_step(
-                    current,
-                    condition,
-                    flow_time=t,
-                    next_flow_time=next_t,
-                    stochastic=True,
-                    eta=self.eta,
-                    generator=generator,
-                )
-                latent = transition.next_sample
-                for step in range(branch_timestep + 1, num_steps):
-                    step_t = flow_times[step]
-                    step_next_t = flow_times[step + 1]
-                    if step_next_t == step_t:
-                        continue
-                    latent = self.policy.sample_one_step(
-                        latent,
+            for branch_id, noise_seed in zip(branch_ids, branch_noise_seeds):
+                branch_id = int(branch_id)
+                with isolated_rng(
+                    int(noise_seed), devices=_rng_devices(self.runtime.device)
+                ):
+                    generator = torch.Generator(device=self.runtime.device).manual_seed(int(noise_seed))
+                    transition = self.policy.sample_one_step(
+                        current,
                         condition,
-                        flow_time=step_t,
-                        next_flow_time=step_next_t,
-                        stochastic=False,
+                        flow_time=t,
+                        next_flow_time=next_t,
+                        stochastic=True,
                         eta=self.eta,
+                        generator=generator,
                     )
-                future = self.policy.decode_video(latent).detach().cpu()
+                    latent = transition.next_sample
+                    for step in range(branch_timestep + 1, num_steps):
+                        step_t = flow_times[step]
+                        step_next_t = flow_times[step + 1]
+                        if step_next_t == step_t:
+                            continue
+                        latent = self.policy.sample_one_step(
+                            latent,
+                            condition,
+                            flow_time=step_t,
+                            next_flow_time=step_next_t,
+                            stochastic=False,
+                            eta=self.eta,
+                        )
+                    future = self.policy.decode_video(latent).detach().cpu()
                 full_video = torch.cat((prepared.observation, future), dim=2).clamp(-1.0, 1.0)
                 seed_dir = group_dir / f"branch_{branch_id:03d}"
                 seed_dir.mkdir(parents=True, exist_ok=False)
@@ -253,6 +272,7 @@ class TempFlowBranchSampler:
                     next_flow_time=next_t,
                     eta=self.eta,
                     old_log_prob=float(transition.log_prob.mean().item()),
+                    old_token_log_prob=transition.token_log_prob.detach().cpu(),
                     rf_noise_std=float(transition.rf_noise_std.item()),
                     noise_weight=float(weights[branch_timestep].item()),
                     prefix_latent_sha256=prefix_digest,
@@ -280,7 +300,9 @@ class TempFlowBranchSampler:
                 for camera in self.runtime.args.data["train"]["valid_cam"]
             },
         }
-        if all(len(set(values)) == 1 for values in group_payload["video_sha256"].values()):
+        if len(rollouts) > 1 and all(
+            len(set(values)) == 1 for values in group_payload["video_sha256"].values()
+        ):
             raise RuntimeError("all branch videos are byte-identical despite distinct exploration noise")
         (group_dir / "group.json").write_text(
             json.dumps(group_payload, ensure_ascii=False, indent=2), encoding="utf-8"
@@ -391,6 +413,7 @@ class FlowGRPOVideoSampler:
                             next_flow_time=next_flow_time,
                             eta=self.eta,
                             old_log_prob=float(transition.log_prob.mean().item()),
+                            old_token_log_prob=transition.token_log_prob.detach().cpu(),
                             rf_noise_std=float(transition.rf_noise_std.item()),
                             noise_weight=float(weights[timestep].item()),
                             noise_seed=noise_seed,

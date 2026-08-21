@@ -13,6 +13,7 @@ class FlowTransition:
 
     next_sample: torch.Tensor
     log_prob: torch.Tensor
+    token_log_prob: torch.Tensor
     mean: torch.Tensor
     std: torch.Tensor
     rf_noise_std: torch.Tensor
@@ -47,14 +48,39 @@ def paper_exploration_scale(flow_time: float, eta: float) -> float:
     return eta * math.sqrt(t / (1.0 - t))
 
 
-def _normal_log_prob(sample: torch.Tensor, mean: torch.Tensor, std: torch.Tensor) -> torch.Tensor:
+def _normal_element_log_prob(
+    sample: torch.Tensor, mean: torch.Tensor, std: torch.Tensor
+) -> torch.Tensor:
     if sample.shape != mean.shape:
         raise ValueError(f"sample/mean shape mismatch: {sample.shape} != {mean.shape}")
     if torch.any(std <= 0) or not torch.isfinite(std).all():
         raise ValueError("transition std must be finite and positive")
-    log_prob = -((sample.detach() - mean) ** 2) / (2.0 * std.square())
-    log_prob = log_prob - torch.log(std) - 0.5 * math.log(2.0 * math.pi)
-    return log_prob.mean(dim=tuple(range(1, log_prob.ndim)))
+    sample_float = sample.detach().float()
+    mean_float = mean.float()
+    std_float = std.float()
+    log_prob = -((sample_float - mean_float) ** 2) / (2.0 * std_float.square())
+    return log_prob - torch.log(std_float) - 0.5 * math.log(2.0 * math.pi)
+
+
+def _normal_log_prob(sample: torch.Tensor, mean: torch.Tensor, std: torch.Tensor) -> torch.Tensor:
+    element_log_prob = _normal_element_log_prob(sample, mean, std)
+    return element_log_prob.mean(dim=tuple(range(1, element_log_prob.ndim)))
+
+
+def _normal_token_log_prob(
+    sample: torch.Tensor, mean: torch.Tensor, std: torch.Tensor
+) -> torch.Tensor:
+    """Return one normalized log probability per latent spatiotemporal token.
+
+    Video latents are laid out as ``[view, channel, time, height, width]``.
+    Averaging channels keeps each time/space location as a separate PPO action
+    unit without constructing an unstable joint likelihood over the full video.
+    """
+
+    element_log_prob = _normal_element_log_prob(sample, mean, std)
+    if element_log_prob.ndim < 2:
+        raise ValueError("token log probability requires batch and channel dimensions")
+    return element_log_prob.mean(dim=1)
 
 
 def edm_transition_mean(
@@ -128,9 +154,11 @@ def edm_sde_transition_with_logprob(
             raise ValueError("next sample shape must match the latent")
         exploration_noise = (next_sample.detach() - mean.detach()) / std
     log_prob = _normal_log_prob(next_sample, mean, std)
+    token_log_prob = _normal_token_log_prob(next_sample, mean, std)
     return FlowTransition(
         next_sample=next_sample,
         log_prob=log_prob,
+        token_log_prob=token_log_prob,
         mean=mean,
         std=std,
         rf_noise_std=rf_std,

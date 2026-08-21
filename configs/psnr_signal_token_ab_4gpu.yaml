@@ -1,0 +1,14 @@
+base_config: ${TEMPFLOW_STANDALONE_ROOT}/configs/psnr_signal_overfit_4gpu.yaml
+output_dir: ${TEMPFLOW_OUTPUT_ROOT}/psnr_signal_token_ab_4gpu
+max_optimizer_steps: 10
+
+experiment:
+  name: psnr_signal_token_ab_4gpu
+
+training:
+  max_optimizer_steps: 10
+  max_rollout_epochs: 5
+  checkpoint_every: 10
+
+evaluation:
+  every_optimizer_steps: 10

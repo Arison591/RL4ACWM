@@ -37,7 +37,9 @@ def test_branches_share_state_but_use_distinct_noise():
     assert not torch.equal(first.exploration_noise, second.exploration_noise)
     assert not torch.equal(first.next_sample, second.next_sample)
     assert first.log_prob.shape == (1,)
+    assert first.token_log_prob.shape == (1, 2, 2)
     assert torch.isfinite(first.log_prob).all()
+    assert torch.isfinite(first.token_log_prob).all()
 
 
 def test_collected_transition_recomputes_exact_logprob_and_has_gradient():
@@ -62,6 +64,9 @@ def test_collected_transition_recomputes_exact_logprob_and_has_gradient():
     )
 
     assert torch.allclose(rescored.log_prob, collected.log_prob, atol=1.0e-12, rtol=0.0)
+    assert torch.allclose(
+        rescored.token_log_prob, collected.token_log_prob, atol=1.0e-7, rtol=0.0
+    )
     (-rescored.log_prob.mean()).backward()
     assert train_velocity.grad is not None
     assert torch.isfinite(train_velocity.grad).all()
